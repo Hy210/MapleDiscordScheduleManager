@@ -91,6 +91,33 @@ describe("Workers AI LLM adapter", () => {
 		});
 	});
 
+	it("passes update_reminder results through validation", async () => {
+		const env: WorkersAiEnv = {
+			AI: {
+				run: vi.fn(async () => ({
+					response: JSON.stringify({
+						intent: "update_reminder",
+						title: "보스",
+						clear_repeat: true,
+						timezone: "Asia/Seoul",
+						confidence: 0.9,
+					}),
+				})),
+			},
+		};
+
+		await expect(
+			parseWithLlm("반복 없애고 보스로", { now: "2026-04-25T10:00:00+09:00" }, env),
+		).resolves.toMatchObject({
+			status: "ok",
+			value: {
+				intent: "update_reminder",
+				title: "보스",
+				clear_repeat: true,
+			},
+		});
+	});
+
 	it("rejects non-JSON Workers AI responses safely", async () => {
 		const env: WorkersAiEnv = {
 			AI: {

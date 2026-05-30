@@ -11,10 +11,16 @@ import {
 } from "../src/crawler/maplestory";
 import worker, {
 	buildAlertMessageWithReadStatus,
+	buildReminderUpdateFromInput,
+	buildScheduleOverrideFromInput,
 	buildReadStatusSection,
 	confirmDeleteSchedule,
+	confirmScheduleOverride,
+	confirmUpdateReminderSchedule,
 	createPendingCrawlScheduleAction,
 	createPendingReminderAction,
+	createPendingScheduleOverrideAction,
+	createPendingUpdateReminderAction,
 	formatHelpMessage,
 	formatScheduleList,
 	insertCrawlScheduleFromPending,
@@ -29,6 +35,8 @@ import worker, {
 	markPendingActionConsumed,
 	parsePendingCrawlSchedulePayload,
 	parsePendingReminderPayload,
+	parsePendingScheduleOverridePayload,
+	parsePendingUpdateReminderPayload,
 	parseRelativeDate,
 	processDueSchedules,
 	ruleParseReminderDetailed,
@@ -41,6 +49,54 @@ import worker, {
 // For now, you'll need to do something like this to get a correctly-typed
 // `Request` to pass to `worker.fetch()`.
 const IncomingRequest = Request<unknown, IncomingRequestCfProperties>;
+
+type TestScheduleSnapshot = Parameters<typeof buildReminderUpdateFromInput>[0];
+type TestOverrideRow = NonNullable<Parameters<typeof buildScheduleOverrideFromInput>[2]>;
+
+function makeReminderSnapshot(
+	overrides: Partial<TestScheduleSnapshot> = {},
+): TestScheduleSnapshot {
+	return {
+		id: "schedule_1",
+		type: "reminder",
+		title: "Boss",
+		target_url: null,
+		keywords_json: null,
+		run_at: "2026-04-26T09:00:00+09:00",
+		repeat_rule: null,
+		interval_minutes: null,
+		timezone: "Asia/Seoul",
+		notify_channel_id: "channel_123",
+		is_active: 1,
+		next_run_at: "2026-04-26T09:00:00+09:00",
+		last_run_at: null,
+		last_success_at: null,
+		last_error: null,
+		created_by: "user_111",
+		updated_by: "user_111",
+		created_at: "2026-04-25T00:00:00.000Z",
+		updated_at: "2026-04-25T00:00:00.000Z",
+		parent_schedule_id: null,
+		reminder_kind: "main",
+		offset_minutes: null,
+		...overrides,
+	};
+}
+
+function makeOverrideRow(overrides: Partial<TestOverrideRow> = {}): TestOverrideRow {
+	return {
+		id: "override_1",
+		schedule_id: "schedule_1",
+		title: null,
+		run_at: "2026-04-26T22:00:00+09:00",
+		status: "pending",
+		created_by: "user_456",
+		consumed_at: null,
+		created_at: "2026-04-25T00:00:00.000Z",
+		updated_at: "2026-04-25T00:00:00.000Z",
+		...overrides,
+	};
+}
 
 describe("Discord interaction endpoint", () => {
 	afterEach(() => {
@@ -574,6 +630,148 @@ describe("Discord interaction endpoint", () => {
 		expect(binds[3]).toBe("pending");
 	});
 
+	it("stores reminder update candidates in pending_actions", async () => {
+		const binds: unknown[] = [];
+		const before = makeReminderSnapshot();
+		const after = { ...before, title: "New Boss" };
+		const db = {
+			prepare: (sql: string) => ({
+				bind: (...values: unknown[]) => {
+					expect(sql).toContain("INSERT INTO pending_actions");
+					binds.push(...values);
+					return { run: async () => ({ success: true }) };
+				},
+			}),
+		} as unknown as D1Database;
+
+		const pendingId = await createPendingUpdateReminderAction(db, {
+			scheduleId: before.id,
+			before,
+			after,
+			notifyChannelId: "channel_123",
+			userId: "user_456",
+			changeInput: "제목을 New Boss로 바꿔줘",
+			preReminderAction: "upsert",
+		});
+
+		expect(binds[0]).toBe(pendingId);
+		expect(binds[1]).toBe("update_reminder");
+		expect(parsePendingUpdateReminderPayload(String(binds[2]))).toMatchObject({
+			schedule_id: before.id,
+			notify_channel_id: "channel_123",
+			created_by: "user_456",
+			change_input: "제목을 New Boss로 바꿔줘",
+			pre_reminder_action: "upsert",
+			after: { title: "New Boss" },
+		});
+	});
+
+	it("parses reminder update payloads defensively", () => {
+		const before = makeReminderSnapshot();
+		const payload = {
+			schedule_id: before.id,
+			before,
+			after: { ...before, title: "New Boss" },
+			notify_channel_id: "channel_123",
+			created_by: "user_456",
+			change_input: "제목을 New Boss로 바꿔줘",
+			pre_reminder_action: "upsert",
+		};
+
+		expect(parsePendingUpdateReminderPayload(JSON.stringify(payload))).toMatchObject({
+			schedule_id: before.id,
+		});
+		expect(parsePendingUpdateReminderPayload("{")).toBeNull();
+		expect(
+			parsePendingUpdateReminderPayload(
+				JSON.stringify({ ...payload, pre_reminder_action: "bad" }),
+			),
+		).toBeNull();
+	});
+
+	it("stores one-time override candidates in pending_actions", async () => {
+		const binds: unknown[] = [];
+		const beforeSchedule = makeReminderSnapshot({
+			repeat_rule: JSON.stringify({ type: "daily", time: "09:00" }),
+		});
+		const afterOverride = {
+			id: "override_2",
+			schedule_id: beforeSchedule.id,
+			title: "Hard Boss",
+			run_at: "2026-04-26T22:00:00+09:00",
+			status: "pending" as const,
+			created_by: "user_456",
+			created_at: "2026-04-25T00:00:00.000Z",
+			updated_at: "2026-04-25T00:00:00.000Z",
+		};
+		const db = {
+			prepare: (sql: string) => ({
+				bind: (...values: unknown[]) => {
+					expect(sql).toContain("INSERT INTO pending_actions");
+					binds.push(...values);
+					return { run: async () => ({ success: true }) };
+				},
+			}),
+		} as unknown as D1Database;
+
+		const pendingId = await createPendingScheduleOverrideAction(db, {
+			scheduleId: beforeSchedule.id,
+			beforeSchedule,
+			existingOverride: null,
+			afterOverride,
+			notifyChannelId: "channel_123",
+			userId: "user_456",
+			changeInput: "오늘 오후 10시에 제목은 Hard Boss로",
+			preReminderAction: "upsert",
+		});
+
+		expect(binds[0]).toBe(pendingId);
+		expect(binds[1]).toBe("create_schedule_override");
+		expect(parsePendingScheduleOverridePayload(String(binds[2]))).toMatchObject({
+			schedule_id: beforeSchedule.id,
+			existing_override: null,
+			after_override: {
+				title: "Hard Boss",
+				run_at: "2026-04-26T22:00:00+09:00",
+			},
+		});
+	});
+
+	it("parses one-time override payloads defensively", () => {
+		const beforeSchedule = makeReminderSnapshot({
+			repeat_rule: JSON.stringify({ type: "weekly", day_of_week: "monday", time: "09:00" }),
+		});
+		const payload = {
+			schedule_id: beforeSchedule.id,
+			before_schedule: beforeSchedule,
+			existing_override: makeOverrideRow(),
+			after_override: {
+				id: "override_2",
+				schedule_id: beforeSchedule.id,
+				title: null,
+				run_at: "2026-04-27T22:00:00+09:00",
+				status: "pending",
+				created_by: "user_456",
+				created_at: "2026-04-25T00:00:00.000Z",
+				updated_at: "2026-04-25T00:00:00.000Z",
+			},
+			created_by: "user_456",
+			change_input: "오후 10시로",
+			pre_reminder_action: "upsert",
+		};
+
+		expect(parsePendingScheduleOverridePayload(JSON.stringify(payload))).toMatchObject({
+			schedule_id: beforeSchedule.id,
+			existing_override: { id: "override_1" },
+		});
+		expect(parsePendingScheduleOverridePayload("{")).toBeNull();
+		expect(
+			parsePendingScheduleOverridePayload(
+				JSON.stringify({ ...payload, after_override: { ...payload.after_override, status: "bad" } }),
+			),
+		).toBeNull();
+	});
+
 	it("inserts confirmed crawl schedules and records change history", async () => {
 		const scheduleBinds: unknown[] = [];
 		const changeBinds: unknown[] = [];
@@ -887,6 +1085,12 @@ describe("Discord interaction endpoint", () => {
 					};
 				}
 
+				if (sql.includes("UPDATE schedule_overrides")) {
+					return {
+						bind: () => ({ run: async () => ({ success: true }) }),
+					};
+				}
+
 				return {
 					bind: (...values: unknown[]) => {
 						expect(sql).toContain("INSERT INTO schedule_changes");
@@ -917,6 +1121,195 @@ describe("Discord interaction endpoint", () => {
 			next_run_at: null,
 			updated_by: "user_222",
 		});
+	});
+
+	it("confirms reminder updates and records update history", async () => {
+		const before = makeReminderSnapshot();
+		const after = {
+			...before,
+			title: "New Boss",
+			repeat_rule: JSON.stringify({ type: "interval", minutes: 30 }),
+			next_run_at: "2026-06-26T10:00:00+09:00",
+			run_at: "2026-06-26T10:00:00+09:00",
+		};
+		const updateBinds: unknown[][] = [];
+		const changeBinds: unknown[][] = [];
+		const db = {
+			prepare: (sql: string) => {
+				if (sql.includes("FROM schedules") && sql.includes("parent_schedule_id = ?")) {
+					return {
+						bind: () => ({
+							all: async () => ({ results: [] }),
+						}),
+					};
+				}
+				if (sql.includes("FROM schedules")) {
+					return {
+						bind: () => ({
+							first: async () => before,
+						}),
+					};
+				}
+				if (sql.includes("UPDATE schedules")) {
+					return {
+						bind: (...values: unknown[]) => {
+							updateBinds.push(values);
+							return { run: async () => ({ success: true }) };
+						},
+					};
+				}
+				return {
+					bind: (...values: unknown[]) => {
+						expect(sql).toContain("INSERT INTO schedule_changes");
+						changeBinds.push(values);
+						return { run: async () => ({ success: true }) };
+					},
+				};
+			},
+		} as unknown as D1Database;
+
+		await expect(
+			confirmUpdateReminderSchedule(
+				db,
+				{
+					schedule_id: before.id,
+					before,
+					after,
+					notify_channel_id: "channel_123",
+					created_by: "user_456",
+					change_input: "제목을 New Boss로 바꿔줘",
+					pre_reminder_action: "upsert",
+				},
+				"user_789",
+			),
+		).resolves.toBe("updated");
+
+		expect(updateBinds[0]).toEqual([
+			"New Boss",
+			"2026-06-26T10:00:00+09:00",
+			JSON.stringify({ type: "interval", minutes: 30 }),
+			"2026-06-26T10:00:00+09:00",
+			"user_789",
+			expect.any(String),
+			before.id,
+		]);
+		expect(changeBinds[0][1]).toBe(before.id);
+		expect(changeBinds[0][2]).toBe("user_789");
+		expect(changeBinds[0][3]).toBe("update");
+		expect(JSON.parse(String(changeBinds[0][5]))).toMatchObject({
+			title: "New Boss",
+			updated_by: "user_789",
+		});
+	});
+
+	it("confirms one-time overrides, replaces existing overrides, and moves next_run_at", async () => {
+		const before = makeReminderSnapshot({
+			repeat_rule: JSON.stringify({ type: "daily", time: "09:00" }),
+			next_run_at: "2026-06-26T09:00:00+09:00",
+			run_at: "2026-06-26T09:00:00+09:00",
+		});
+		const existingOverride = makeOverrideRow({
+			run_at: "2026-06-26T21:00:00+09:00",
+		});
+		const afterOverride = {
+			id: "override_2",
+			schedule_id: before.id,
+			title: "Hard Boss",
+			run_at: "2026-06-26T22:00:00+09:00",
+			status: "pending" as const,
+			created_by: "user_456",
+			created_at: "2026-04-25T00:00:00.000Z",
+			updated_at: "2026-04-25T00:00:00.000Z",
+		};
+		const updateBinds: unknown[][] = [];
+		const insertOverrideBinds: unknown[][] = [];
+		const changeBinds: unknown[][] = [];
+		const db = {
+			prepare: (sql: string) => {
+				if (sql.includes("FROM schedule_overrides")) {
+					return {
+						bind: () => ({
+							first: async () => existingOverride,
+						}),
+					};
+				}
+				if (sql.includes("FROM schedules") && sql.includes("parent_schedule_id = ?")) {
+					return {
+						bind: () => ({
+							all: async () => ({ results: [] }),
+						}),
+					};
+				}
+				if (sql.includes("FROM schedules")) {
+					return {
+						bind: () => ({
+							first: async () => before,
+						}),
+					};
+				}
+				if (sql.includes("INSERT INTO schedule_overrides")) {
+					return {
+						bind: (...values: unknown[]) => {
+							insertOverrideBinds.push(values);
+							return { run: async () => ({ success: true }) };
+						},
+					};
+				}
+				if (sql.includes("INSERT INTO schedules")) {
+					return {
+						bind: () => ({ run: async () => ({ success: true }) }),
+					};
+				}
+				if (sql.includes("UPDATE")) {
+					return {
+						bind: (...values: unknown[]) => {
+							updateBinds.push(values);
+							return { run: async () => ({ success: true }) };
+						},
+					};
+				}
+				return {
+					bind: (...values: unknown[]) => {
+						expect(sql).toContain("INSERT INTO schedule_changes");
+						changeBinds.push(values);
+						return { run: async () => ({ success: true }) };
+					},
+				};
+			},
+		} as unknown as D1Database;
+
+		await expect(
+			confirmScheduleOverride(
+				db,
+				{
+					schedule_id: before.id,
+					before_schedule: before,
+					existing_override: existingOverride,
+					after_override: afterOverride,
+					created_by: "user_456",
+					change_input: "오후 10시에 제목은 Hard Boss로",
+					pre_reminder_action: "upsert",
+				},
+				"user_789",
+			),
+		).resolves.toBe("created");
+
+		expect(updateBinds.some((values) => values.includes(existingOverride.id))).toBe(true);
+		expect(insertOverrideBinds[0]).toEqual([
+			"override_2",
+			before.id,
+			"Hard Boss",
+			"2026-06-26T22:00:00+09:00",
+			"pending",
+			"user_789",
+			null,
+			expect.any(String),
+			expect.any(String),
+		]);
+		expect(updateBinds.some((values) => values[0] === "2026-06-26T22:00:00+09:00")).toBe(
+			true,
+		);
+		expect(changeBinds[0][3]).toBe("override_replace");
 	});
 
 	it("parses repeat reminders", () => {
@@ -1435,15 +1828,13 @@ describe("Discord interaction endpoint", () => {
 		expect(body.content).toContain("<@user_123>님이 곧 보스가자고 해요!");
 		expect(body.content).toContain("본 일정 시간: 2026년 5월 9일 토요일 오후 9시 00분");
 		expect(body.content).toContain("알림 시간: 2026년 5월 9일 토요일 오후 8시 30분");
-		expect(body.content).not.toContain("諛섎났");
+		expect(body.content).not.toContain("반복");
 		expect(body.content).not.toContain("1회성 일정");
-		expect(updateBinds).toEqual([
-			[
-				"2026-05-09T11:30:00.000Z",
-				"2026-05-09T11:30:00.000Z",
-				"2026-05-09T11:30:00.000Z",
-				"schedule_pre",
-			],
+		expect(updateBinds).toContainEqual([
+			"2026-05-09T11:30:00.000Z",
+			"2026-05-09T11:30:00.000Z",
+			"2026-05-09T11:30:00.000Z",
+			"schedule_pre",
 		]);
 	});
 
@@ -1625,7 +2016,9 @@ describe("Discord interaction endpoint", () => {
 			"https://maplestory.nexon.com/news/update/777",
 		);
 		expect(secondDiscordBody.content).not.toContain("[신규 메이플 업데이트 감지]");
-		expect(updateBinds).toHaveLength(2);
+		expect(
+			updateBinds.filter((values) => values.at(-1) === "reminder_1" || values.at(-1) === "reminder_2"),
+		).toHaveLength(2);
 		expect(
 			fetchMock.mock.calls.filter(
 				([url]) => url === "https://m.maplestory.nexon.com/news/update",
@@ -2218,6 +2611,351 @@ describe("Discord interaction endpoint", () => {
 		expect(scheduleUpdate?.[0]).toBe("2026-04-27T08:15:00+09:00");
 	});
 
+	it("builds title-only reminder updates without changing schedule time", () => {
+		const before = makeReminderSnapshot();
+		const result = buildReminderUpdateFromInput(
+			before,
+			"제목을 New Boss로 바꿔줘",
+			new Date("2026-04-25T00:00:00.000Z"),
+		);
+
+		expect(result).toMatchObject({
+			ok: true,
+			after: {
+				title: "New Boss",
+				run_at: before.run_at,
+				repeat_rule: before.repeat_rule,
+				next_run_at: before.next_run_at,
+			},
+		});
+	});
+
+	it("changes only the time for one-time reminders while keeping the date", () => {
+		const result = buildReminderUpdateFromInput(
+			makeReminderSnapshot({ run_at: "2026-04-26T09:00:00+09:00" }),
+			"오후 10시로 바꿔줘",
+			new Date("2026-04-25T00:00:00.000Z"),
+		);
+
+		expect(result).toMatchObject({
+			ok: true,
+			after: {
+				run_at: "2026-04-26T22:00:00+09:00",
+				next_run_at: "2026-04-26T22:00:00+09:00",
+				repeat_rule: null,
+			},
+		});
+	});
+
+	it("updates daily repeat time and recalculates the next run", () => {
+		const result = buildReminderUpdateFromInput(
+			makeReminderSnapshot({
+				repeat_rule: JSON.stringify({ type: "daily", time: "09:00" }),
+				run_at: "2026-04-26T09:00:00+09:00",
+				next_run_at: "2026-04-26T09:00:00+09:00",
+			}),
+			"오후 10시로 바꿔줘",
+			new Date("2026-04-25T00:00:00.000Z"),
+		);
+
+		expect(result).toMatchObject({
+			ok: true,
+			after: {
+				repeat_rule: JSON.stringify({ type: "daily", time: "22:00" }),
+				next_run_at: "2026-04-25T22:00:00+09:00",
+			},
+		});
+	});
+
+	it("keeps the next run and clears repeat when requested", () => {
+		const result = buildReminderUpdateFromInput(
+			makeReminderSnapshot({
+				repeat_rule: JSON.stringify({ type: "weekly", day_of_week: "monday", time: "09:00" }),
+				run_at: "2026-04-27T09:00:00+09:00",
+				next_run_at: "2026-04-27T09:00:00+09:00",
+			}),
+			"반복 없애줘",
+			new Date("2026-04-25T00:00:00.000Z"),
+		);
+
+		expect(result).toMatchObject({
+			ok: true,
+			after: {
+				repeat_rule: null,
+				run_at: "2026-04-27T09:00:00+09:00",
+				next_run_at: "2026-04-27T09:00:00+09:00",
+			},
+		});
+	});
+
+	it("rejects time-only updates for interval reminders", () => {
+		const result = buildReminderUpdateFromInput(
+			makeReminderSnapshot({
+				repeat_rule: JSON.stringify({ type: "interval", minutes: 30 }),
+				run_at: "2026-04-25T10:30:00+09:00",
+				next_run_at: "2026-04-25T10:30:00+09:00",
+			}),
+			"오후 10시로 바꿔줘",
+			new Date("2026-04-25T00:00:00.000Z"),
+		);
+
+		expect(result).toMatchObject({ ok: false });
+	});
+
+	it("omits pre reminders when the calculated pre reminder time is past", () => {
+		const result = buildReminderUpdateFromInput(
+			makeReminderSnapshot({
+				run_at: "2026-04-25T21:30:00+09:00",
+				next_run_at: "2026-04-25T21:30:00+09:00",
+			}),
+			"오후 10시로 바꿔줘",
+			new Date("2026-04-25T21:45:00+09:00"),
+		);
+
+		expect(result).toMatchObject({
+			ok: true,
+			preReminderAction: "disable",
+			after: { next_run_at: "2026-04-25T22:00:00+09:00" },
+		});
+	});
+
+	it("moves the update date to the next occurrence of a bare weekday", () => {
+		// now = 2026-04-25 (토요일 KST). 다음 목요일 = 2026-04-30
+		const result = buildReminderUpdateFromInput(
+			makeReminderSnapshot({
+				repeat_rule: JSON.stringify({ type: "weekly", day_of_week: "saturday", time: "21:00" }),
+				run_at: "2026-04-25T21:00:00+09:00",
+				next_run_at: "2026-04-25T21:00:00+09:00",
+			}),
+			"목요일 오후 9시 30분으로 바꿔줘",
+			new Date("2026-04-25T00:00:00.000Z"),
+		);
+
+		expect(result).toMatchObject({
+			ok: true,
+			after: { next_run_at: "2026-04-30T21:30:00+09:00" },
+		});
+	});
+
+	it("moves the update date to today when the bare weekday matches today and time is in the future", () => {
+		// now = 2026-04-23 (목요일 KST) 오전 10시. 목요일 21:30은 아직 미래
+		const result = buildReminderUpdateFromInput(
+			makeReminderSnapshot({
+				repeat_rule: JSON.stringify({ type: "daily", time: "09:00" }),
+				run_at: "2026-04-24T09:00:00+09:00",
+				next_run_at: "2026-04-24T09:00:00+09:00",
+			}),
+			"목요일 오후 9시 30분으로 바꿔줘",
+			new Date("2026-04-23T01:00:00.000Z"), // UTC 01:00 = KST 10:00
+		);
+
+		expect(result).toMatchObject({
+			ok: true,
+			after: { next_run_at: "2026-04-23T21:30:00+09:00" },
+		});
+	});
+
+	it("builds one-time overrides from time-only input using the next occurrence date", () => {
+		const schedule = makeReminderSnapshot({
+			repeat_rule: JSON.stringify({ type: "daily", time: "09:00" }),
+			next_run_at: "2026-04-26T09:00:00+09:00",
+			run_at: "2026-04-26T09:00:00+09:00",
+		});
+
+		const result = buildScheduleOverrideFromInput(
+			schedule,
+			"오후 10시로",
+			null,
+			"user_456",
+			new Date("2026-04-25T00:00:00.000Z"),
+		);
+
+		expect(result).toMatchObject({
+			ok: true,
+			afterOverride: {
+				title: null,
+				run_at: "2026-04-26T22:00:00+09:00",
+			},
+			preReminderAction: "upsert",
+		});
+	});
+
+	it("builds one-time overrides from title-only input while keeping the next run time", () => {
+		const schedule = makeReminderSnapshot({
+			repeat_rule: JSON.stringify({ type: "weekly", day_of_week: "monday", time: "09:00" }),
+			next_run_at: "2026-04-27T09:00:00+09:00",
+			run_at: "2026-04-27T09:00:00+09:00",
+		});
+
+		const result = buildScheduleOverrideFromInput(
+			schedule,
+			"이번만 제목을 Hard Boss로",
+			null,
+			"user_456",
+			new Date("2026-04-25T00:00:00.000Z"),
+		);
+
+		expect(result).toMatchObject({
+			ok: true,
+			afterOverride: {
+				title: "Hard Boss",
+				run_at: "2026-04-27T09:00:00+09:00",
+			},
+		});
+	});
+
+	it("rejects one-time overrides for non daily-weekly schedules", () => {
+		const result = buildScheduleOverrideFromInput(
+			makeReminderSnapshot({ repeat_rule: JSON.stringify({ type: "interval", minutes: 30 }) }),
+			"오후 10시로",
+			null,
+			"user_456",
+			new Date("2026-04-25T00:00:00.000Z"),
+		);
+
+		expect(result).toMatchObject({ ok: false });
+	});
+
+	it("moves the date to the next occurrence of a bare weekday", () => {
+		// now = 2026-04-25 (토요일 KST). 다음 목요일 = 2026-04-30
+		const schedule = makeReminderSnapshot({
+			repeat_rule: JSON.stringify({ type: "weekly", day_of_week: "saturday", time: "21:00" }),
+			next_run_at: "2026-04-25T21:00:00+09:00",
+			run_at: "2026-04-25T21:00:00+09:00",
+		});
+
+		const result = buildScheduleOverrideFromInput(
+			schedule,
+			"목요일 오후 9시 30분",
+			null,
+			"user_456",
+			new Date("2026-04-25T00:00:00.000Z"),
+		);
+
+		expect(result).toMatchObject({
+			ok: true,
+			afterOverride: {
+				title: null,
+				run_at: "2026-04-30T21:30:00+09:00",
+			},
+		});
+	});
+
+	it("moves the date to tomorrow when 내일 is specified", () => {
+		// now = 2026-04-25 KST. 내일 = 2026-04-26
+		const schedule = makeReminderSnapshot({
+			repeat_rule: JSON.stringify({ type: "daily", time: "09:00" }),
+			next_run_at: "2026-04-26T09:00:00+09:00",
+			run_at: "2026-04-26T09:00:00+09:00",
+		});
+
+		const result = buildScheduleOverrideFromInput(
+			schedule,
+			"내일 오후 9시 30분",
+			null,
+			"user_456",
+			new Date("2026-04-25T00:00:00.000Z"),
+		);
+
+		expect(result).toMatchObject({
+			ok: true,
+			afterOverride: {
+				run_at: "2026-04-26T21:30:00+09:00",
+			},
+		});
+	});
+
+	it("moves the date to the day after tomorrow when 모레 is specified", () => {
+		// now = 2026-04-25 KST. 모레 = 2026-04-27
+		const schedule = makeReminderSnapshot({
+			repeat_rule: JSON.stringify({ type: "daily", time: "09:00" }),
+			next_run_at: "2026-04-26T09:00:00+09:00",
+			run_at: "2026-04-26T09:00:00+09:00",
+		});
+
+		const result = buildScheduleOverrideFromInput(
+			schedule,
+			"모레 오후 9시 30분",
+			null,
+			"user_456",
+			new Date("2026-04-25T00:00:00.000Z"),
+		);
+
+		expect(result).toMatchObject({
+			ok: true,
+			afterOverride: {
+				run_at: "2026-04-27T21:30:00+09:00",
+			},
+		});
+	});
+
+	it("moves the date to next week's weekday when 다음 주 is specified", () => {
+		// now = 2026-04-25 (토요일 KST). 다음 주 목요일 = 2026-04-30 (+7 from current week's Thursday)
+		const schedule = makeReminderSnapshot({
+			repeat_rule: JSON.stringify({ type: "weekly", day_of_week: "saturday", time: "21:00" }),
+			next_run_at: "2026-04-25T21:00:00+09:00",
+			run_at: "2026-04-25T21:00:00+09:00",
+		});
+
+		const result = buildScheduleOverrideFromInput(
+			schedule,
+			"다음 주 목요일 오후 9시 30분",
+			null,
+			"user_456",
+			new Date("2026-04-25T00:00:00.000Z"),
+		);
+
+		expect(result).toMatchObject({
+			ok: true,
+			afterOverride: {
+				run_at: "2026-04-30T21:30:00+09:00",
+			},
+		});
+	});
+
+	it("moves the date to an absolute date when MM월 DD일 is specified", () => {
+		// 6월 10일 오후 9시 30분
+		const schedule = makeReminderSnapshot({
+			repeat_rule: JSON.stringify({ type: "daily", time: "09:00" }),
+			next_run_at: "2026-04-26T09:00:00+09:00",
+			run_at: "2026-04-26T09:00:00+09:00",
+		});
+
+		const result = buildScheduleOverrideFromInput(
+			schedule,
+			"6월 10일 오후 9시 30분",
+			null,
+			"user_456",
+			new Date("2026-04-25T00:00:00.000Z"),
+		);
+
+		expect(result).toMatchObject({
+			ok: true,
+			afterOverride: {
+				run_at: "2026-06-10T21:30:00+09:00",
+			},
+		});
+	});
+
+	it("rejects when the resolved date is in the past", () => {
+		// now = 2026-04-25 오전 10시. 오늘 오전 8시는 이미 과거
+		const schedule = makeReminderSnapshot({
+			repeat_rule: JSON.stringify({ type: "daily", time: "21:00" }),
+			next_run_at: "2026-04-25T21:00:00+09:00",
+			run_at: "2026-04-25T21:00:00+09:00",
+		});
+
+		const result = buildScheduleOverrideFromInput(
+			schedule,
+			"오늘 오전 8시",
+			null,
+			"user_456",
+			new Date("2026-04-25T01:00:00.000Z"), // UTC 01:00 = KST 10:00
+		);
+
+		expect(result).toMatchObject({ ok: false });
+	});
+
 	it("lists active schedules for the current channel", async () => {
 		let boundChannelId = "";
 		const db = {
@@ -2225,7 +2963,7 @@ describe("Discord interaction endpoint", () => {
 				expect(sql).toContain("WHERE s.is_active = 1");
 				expect(sql).toContain("s.notify_channel_id = ?");
 				expect(sql).toContain("s.reminder_kind IS NULL OR s.reminder_kind = 'main'");
-				expect(sql).toContain("LIMIT 10");
+				expect(sql).toContain("LIMIT 5");
 				return {
 					bind: (channelId: string) => {
 						boundChannelId = channelId;
@@ -2326,6 +3064,57 @@ describe("Discord interaction endpoint", () => {
 
 		expect(content).toContain("시간: 2026년 4월 27일 월요일 오후 9시 30분");
 		expect(content).toContain("반복: 매주 월요일 오후 9시 30분");
+	});
+
+	it("shows 이번만 변경 annotation when pending override exists", () => {
+		const content = formatScheduleList([
+			{
+				id: "schedule_1",
+				type: "reminder",
+				title: "보스",
+				run_at: "2026-04-27T21:30:00+09:00",
+				repeat_rule: JSON.stringify({
+					type: "weekly",
+					day_of_week: "monday",
+					time: "21:30",
+				}),
+				notify_channel_id: "channel_123",
+				next_run_at: "2026-04-28T22:00:00+09:00",
+				is_active: 1,
+				created_by: "user_123",
+				created_at: "2026-04-25T00:00:00.000Z",
+				pending_override_run_at: "2026-04-28T22:00:00+09:00",
+				pending_override_title: null,
+			},
+		]);
+
+		expect(content).toContain("2026년 4월 28일 화요일 오후 10시 00분 (이번만 변경)");
+		expect(content).not.toContain("이번만 변경:");
+	});
+
+	it("shows 이번만 변경 with title when override includes title change", () => {
+		const content = formatScheduleList([
+			{
+				id: "schedule_1",
+				type: "reminder",
+				title: "보스",
+				run_at: "2026-04-27T21:30:00+09:00",
+				repeat_rule: JSON.stringify({
+					type: "weekly",
+					day_of_week: "monday",
+					time: "21:30",
+				}),
+				notify_channel_id: "channel_123",
+				next_run_at: "2026-04-28T22:00:00+09:00",
+				is_active: 1,
+				created_by: "user_123",
+				created_at: "2026-04-25T00:00:00.000Z",
+				pending_override_run_at: "2026-04-28T22:00:00+09:00",
+				pending_override_title: "하드 보스",
+			},
+		]);
+
+		expect(content).toContain("2026년 4월 28일 화요일 오후 10시 00분 (이번만 변경: 하드 보스)");
 	});
 
 	it("responds to health checks (unit style)", async () => {

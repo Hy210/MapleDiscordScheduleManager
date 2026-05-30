@@ -4,6 +4,7 @@ import type {
 	LlmDayOfWeek,
 	NormalizedLlmCrawlScheduleIntent,
 	NormalizedLlmReminderIntent,
+	NormalizedLlmUpdateReminderIntent,
 	NormalizedRepeatRule,
 	ValidationResult,
 } from "./schema";
@@ -48,7 +49,10 @@ export function validateLlmIntent(
 		return validateCreateCrawlSchedule(raw);
 	}
 
-	// TODO: update_reminder can be enabled after edit semantics and permission rules are defined.
+	if (intent === "update_reminder") {
+		return validateUpdateReminder(raw, normalizeNow(options.now));
+	}
+
 	return invalid(
 		"unsupported_intent",
 		"지원하지 않는 요청이에요. 현재는 일정 등록과 메이플 업데이트 감지만 지원해요.",
@@ -93,6 +97,77 @@ function validateCreateReminder(raw: JsonObject, now: Date): ValidationResult {
 			? {}
 			: { confidence: confidenceResult.value }),
 	};
+	return { ok: true, value };
+}
+
+function validateUpdateReminder(raw: JsonObject, now: Date): ValidationResult {
+	const confidenceResult = validateConfidence(raw.confidence);
+	if (!confidenceResult.ok) {
+		return confidenceResult;
+	}
+
+	const timezoneResult = normalizeTimezone(raw.timezone);
+	if (!timezoneResult.ok) {
+		return timezoneResult;
+	}
+
+	const value: NormalizedLlmUpdateReminderIntent = {
+		intent: "update_reminder",
+		timezone: SEOUL_TIMEZONE,
+		needs_confirmation: true,
+		...(confidenceResult.value === undefined
+			? {}
+			: { confidence: confidenceResult.value }),
+	};
+
+	if (raw.title !== undefined && raw.title !== null) {
+		const titleResult = normalizeTitle(raw.title, "");
+		if (!titleResult.ok) {
+			return titleResult;
+		}
+		if (titleResult.value) {
+			value.title = titleResult.value;
+		}
+	}
+
+	if (raw.clear_repeat !== undefined) {
+		if (typeof raw.clear_repeat !== "boolean") {
+			return invalid("invalid_clear_repeat", "Invalid clear_repeat value.");
+		}
+		value.clear_repeat = raw.clear_repeat;
+	}
+
+	if (raw.repeat !== undefined || raw.repeat_rule !== undefined) {
+		const repeatResult = normalizeRepeatRule(raw.repeat ?? raw.repeat_rule);
+		if (!repeatResult.ok) {
+			return repeatResult;
+		}
+		value.repeat_rule = repeatResult.value;
+	}
+
+	if (raw.run_at !== undefined && raw.run_at !== null) {
+		if (typeof raw.run_at !== "string" || !raw.run_at.trim()) {
+			return invalid("invalid_update_run_at", "Invalid update time.");
+		}
+		const parsed = new Date(raw.run_at);
+		if (Number.isNaN(parsed.getTime())) {
+			return invalid("invalid_update_run_at", "Invalid update time.");
+		}
+		if (parsed.getTime() <= now.getTime()) {
+			return invalid("past_run_at", "Past reminder times cannot be used.");
+		}
+		value.run_at = raw.run_at;
+	}
+
+	if (
+		value.title === undefined &&
+		value.run_at === undefined &&
+		value.repeat_rule === undefined &&
+		value.clear_repeat === undefined
+	) {
+		return invalid("empty_update", "No reminder changes were found.");
+	}
+
 	return { ok: true, value };
 }
 

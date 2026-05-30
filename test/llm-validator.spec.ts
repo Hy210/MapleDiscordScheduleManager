@@ -212,4 +212,40 @@ describe("LLM intent validator", () => {
 			},
 		});
 	});
+
+	it("accepts partial reminder updates", () => {
+		const result = validateLlmIntent(
+			{
+				intent: "update_reminder",
+				title: "보스",
+				repeat: { type: "daily", time: "22:00" },
+				timezone: "Asia/Seoul",
+				confidence: 0.9,
+			},
+			{ now: NOW },
+		);
+
+		expect(result).toMatchObject({
+			ok: true,
+			value: {
+				intent: "update_reminder",
+				title: "보스",
+				repeat_rule: { type: "daily", time: "22:00" },
+				needs_confirmation: true,
+			},
+		});
+	});
+
+	it("rejects empty reminder updates", () => {
+		const result = validateLlmIntent(
+			{
+				intent: "update_reminder",
+				timezone: "Asia/Seoul",
+				confidence: 0.9,
+			},
+			{ now: NOW },
+		);
+
+		expect(result).toMatchObject({ ok: false, reason: "empty_update" });
+	});
 });

@@ -1,6 +1,7 @@
 export const SUPPORTED_LLM_INTENTS = [
 	"create_reminder",
 	"create_crawl_schedule",
+	"update_reminder",
 ] as const;
 
 export type SupportedLlmIntent = (typeof SUPPORTED_LLM_INTENTS)[number];
@@ -51,9 +52,21 @@ export type NormalizedLlmCrawlScheduleIntent = {
 	confidence?: number;
 };
 
+export type NormalizedLlmUpdateReminderIntent = {
+	intent: "update_reminder";
+	title?: string;
+	run_at?: string | null;
+	repeat_rule?: NormalizedRepeatRule | null;
+	clear_repeat?: boolean;
+	timezone: "Asia/Seoul";
+	needs_confirmation: true;
+	confidence?: number;
+};
+
 export type NormalizedLlmIntent =
 	| NormalizedLlmReminderIntent
-	| NormalizedLlmCrawlScheduleIntent;
+	| NormalizedLlmCrawlScheduleIntent
+	| NormalizedLlmUpdateReminderIntent;
 
 export type ValidationResult =
 	| { ok: true; value: NormalizedLlmIntent }

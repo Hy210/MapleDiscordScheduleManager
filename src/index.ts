@@ -5,8 +5,12 @@ import {
 } from "./crawler/maplestory";
 import { PRE_REMINDER_OFFSET_MINUTES } from "./config/reminder";
 import { MAPLESTORY_UPDATE_PRESET, type CrawlerPreset } from "./crawler/presets";
-import { parseWithLlm, shouldUseLlmFallback, type WorkersAiBinding } from "./llm/adapter";
-import type { NormalizedLlmIntent, NormalizedRepeatRule } from "./llm/schema";
+import { parseWithLlm, parseWithLlmForOverride, shouldUseLlmFallback, type WorkersAiBinding } from "./llm/adapter";
+import type {
+	NormalizedLlmIntent,
+	NormalizedLlmUpdateReminderIntent,
+	NormalizedRepeatRule,
+} from "./llm/schema";
 import {
 	extractReminderTitle,
 	normalizeReminderTitle,
@@ -35,6 +39,7 @@ type DiscordInteraction = {
 		name?: string;
 		custom_id?: string;
 		options?: DiscordInteractionOption[];
+		components?: DiscordModalActionRow[];
 	};
 };
 
@@ -46,6 +51,16 @@ type DiscordInteractionOption = {
 	name: string;
 	type: number;
 	value?: string;
+};
+
+type DiscordModalActionRow = {
+	components?: DiscordModalComponent[];
+};
+
+type DiscordModalComponent = {
+	custom_id?: string;
+	value?: string;
+	components?: DiscordModalComponent[];
 };
 
 type ReminderCandidate = {
@@ -155,6 +170,76 @@ type PendingCrawlSchedulePayload = {
 	created_by: string;
 };
 
+type PendingUpdateReminderPayload = {
+	schedule_id: string;
+	before: ScheduleChangeSnapshot;
+	after: ScheduleChangeSnapshot;
+	notify_channel_id: string;
+	created_by: string;
+	change_input: string;
+	pre_reminder_action: PreReminderPreviewAction;
+};
+
+type ScheduleOverrideRow = {
+	id: string;
+	schedule_id: string;
+	title: string | null;
+	run_at: string;
+	status: "pending" | "consumed" | "cancelled" | "replaced";
+	created_by: string;
+	consumed_at: string | null;
+	created_at: string;
+	updated_at: string;
+};
+
+type ScheduleOverrideCandidate = {
+	id: string;
+	schedule_id: string;
+	title: string | null;
+	run_at: string;
+	status: "pending";
+	created_by: string;
+	created_at: string;
+	updated_at: string;
+};
+
+type PendingScheduleOverridePayload = {
+	schedule_id: string;
+	before_schedule: ScheduleChangeSnapshot;
+	existing_override: ScheduleOverrideRow | null;
+	after_override: ScheduleOverrideCandidate;
+	created_by: string;
+	change_input: string;
+	pre_reminder_action: PreReminderPreviewAction;
+};
+
+type ReminderUpdateBuildResult =
+	| {
+			ok: true;
+			before: ScheduleChangeSnapshot;
+			after: ScheduleChangeSnapshot;
+			preReminderAction: PreReminderPreviewAction;
+	  }
+	| {
+			ok: false;
+			reason: string;
+	  };
+
+type PreReminderPreviewAction = "none" | "upsert" | "disable";
+
+type ScheduleOverrideBuildResult =
+	| {
+			ok: true;
+			beforeSchedule: ScheduleChangeSnapshot;
+			existingOverride: ScheduleOverrideRow | null;
+			afterOverride: ScheduleOverrideCandidate;
+			preReminderAction: PreReminderPreviewAction;
+	  }
+	| {
+			ok: false;
+			reason: string;
+	  };
+
 type ScheduleRow = {
 	id: string;
 	type: string;
@@ -176,6 +261,8 @@ type ScheduleListRow = ScheduleRow & {
 	is_active: number;
 	created_at: string;
 	pre_offset_minutes?: number | null;
+	pending_override_run_at?: string | null;
+	pending_override_title?: string | null;
 };
 
 type ScheduleChangeSnapshot = {
@@ -228,6 +315,8 @@ const DISCORD_PONG = 1;
 const APPLICATION_COMMAND = 2;
 const MESSAGE_COMPONENT = 3;
 const CHANNEL_MESSAGE_WITH_SOURCE = 4;
+const MODAL_SUBMIT = 5;
+const MODAL_RESPONSE = 9;
 const STRING_OPTION = 3;
 const EPHEMERAL_FLAG = 64;
 const CONFIRM_PREFIX = "confirm_reminder:";
@@ -236,6 +325,16 @@ const ACKNOWLEDGE_ALERT_PREFIX = "acknowledge_alert:";
 const DELETE_SCHEDULE_PREFIX = "delete_schedule:";
 const CONFIRM_DELETE_SCHEDULE_PREFIX = "confirm_delete_schedule:";
 const CANCEL_DELETE_SCHEDULE_PREFIX = "cancel_delete_schedule:";
+const UPDATE_SCHEDULE_PREFIX = "update_schedule:";
+const UPDATE_SCHEDULE_MODAL_PREFIX = "update_schedule_modal:";
+const CONFIRM_UPDATE_SCHEDULE_PREFIX = "confirm_update_schedule:";
+const CANCEL_UPDATE_SCHEDULE_PREFIX = "cancel_update_schedule:";
+const UPDATE_SCHEDULE_INPUT_ID = "change_input";
+const OVERRIDE_SCHEDULE_PREFIX = "override_schedule:";
+const OVERRIDE_SCHEDULE_MODAL_PREFIX = "override_schedule_modal:";
+const CONFIRM_OVERRIDE_SCHEDULE_PREFIX = "confirm_override_schedule:";
+const CANCEL_OVERRIDE_SCHEDULE_PREFIX = "cancel_override_schedule:";
+const OVERRIDE_SCHEDULE_INPUT_ID = "override_input";
 const SEOUL_TIMEZONE = "Asia/Seoul";
 const SEOUL_OFFSET_HOURS = 9;
 const AUTO_CHECK_MAPLESTORY_UPDATES = true;
@@ -317,10 +416,70 @@ export default {
 		return handleDiscordInteraction(interaction, env);
 	},
 
-	async scheduled(_event, env, ctx): Promise<void> {
-		ctx.waitUntil(processDueSchedules(env, new Date()));
+	async scheduled(event, env, ctx): Promise<void> {
+		if (event.cron === "0 18 * * *") {
+			ctx.waitUntil(runDailyCleanup(env));
+		} else {
+			ctx.waitUntil(processDueSchedules(env, new Date()));
+		}
 	},
 } satisfies ExportedHandler<Env>;
+
+async function runDailyCleanup(env: Env): Promise<void> {
+	const db = env.DB;
+
+	await db
+		.prepare(
+			`DELETE FROM pending_actions
+			WHERE status != 'pending'
+				AND expires_at < datetime('now', '-1 day')`,
+		)
+		.run();
+
+	await db
+		.prepare(
+			`DELETE FROM alert_reads
+			WHERE read_at < datetime('now', '-90 days')`,
+		)
+		.run();
+
+	await db
+		.prepare(
+			`DELETE FROM alerts
+			WHERE created_at < datetime('now', '-90 days')`,
+		)
+		.run();
+
+	await db
+		.prepare(
+			`DELETE FROM schedule_overrides
+			WHERE status IN ('consumed', 'replaced', 'cancelled')
+				AND updated_at < datetime('now', '-30 days')`,
+		)
+		.run();
+
+	await db
+		.prepare(
+			`DELETE FROM schedule_changes
+			WHERE created_at < datetime('now', '-90 days')`,
+		)
+		.run();
+
+	await db
+		.prepare(
+			`DELETE FROM schedules
+			WHERE is_active = 0
+				AND updated_at < datetime('now', '-30 days')`,
+		)
+		.run();
+
+	await db
+		.prepare(
+			`DELETE FROM detected_events
+			WHERE detected_at < datetime('now', '-6 months')`,
+		)
+		.run();
+}
 
 export async function processDueSchedules(env: Env, now: Date): Promise<void> {
 	const nowDueIso = formatSeoulIso(toSeoulDate(now));
@@ -538,9 +697,15 @@ async function processReminderSchedule(
 
 		const parentSchedule = await getPreReminderParentSchedule(env.DB, schedule);
 		const maplePosts = await getAutoMaplestoryUpdatesForReminder(env.DB, runContext);
+		const override = isPreReminderSchedule(schedule)
+			? null
+			: await getDuePendingScheduleOverride(env.DB, schedule.id, nowIso);
+		const effectiveSchedule = override
+			? applyScheduleOverrideToRow(schedule, override)
+			: schedule;
 		const message = buildAlertMessageWithReadStatus(
 			formatReminderAlertMessage(
-				schedule,
+				effectiveSchedule,
 				env.DISCORD_NOTIFY_ROLE_ID,
 				maplePosts,
 				parentSchedule,
@@ -558,7 +723,7 @@ async function processReminderSchedule(
 		await insertAlert(env.DB, {
 			id: alertId,
 			scheduleId: schedule.id,
-			title: schedule.title,
+			title: effectiveSchedule.title,
 			message,
 			sourceUrl: maplePosts[0]?.link ?? null,
 			discordMessageId,
@@ -566,8 +731,14 @@ async function processReminderSchedule(
 			createdAt: nowIso,
 		});
 
+		if (override) {
+			await markScheduleOverrideConsumed(env.DB, override.id, nowIso);
+		}
 		const nextRunAt = await getNextReminderRunAt(env.DB, schedule, nowIso);
 		await markReminderScheduleSuccess(env.DB, schedule.id, nowIso, nextRunAt);
+		if (override) {
+			await syncMainPreReminderAfterOverride(env.DB, schedule.id, nextRunAt, nowIso);
+		}
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		await markReminderScheduleFailure(env.DB, schedule.id, nowIso, message);
@@ -621,6 +792,18 @@ async function getNextReminderRunAt(
 	}
 
 	return computeNextPreReminderRunAt(parentSchedule, nowIso);
+}
+
+function applyScheduleOverrideToRow(
+	schedule: ScheduleRow,
+	override: ScheduleOverrideRow,
+): ScheduleRow {
+	return {
+		...schedule,
+		title: override.title ?? schedule.title,
+		run_at: override.run_at,
+		next_run_at: override.run_at,
+	};
 }
 
 async function getAutoMaplestoryUpdatesForReminder(
@@ -975,6 +1158,10 @@ async function handleDiscordInteraction(
 		return handleMessageComponent(interaction, env);
 	}
 
+	if (interaction.type === MODAL_SUBMIT) {
+		return handleModalSubmit(interaction, env);
+	}
+
 	return jsonEphemeralInteractionResponse("지원하지 않는 interaction입니다.");
 }
 
@@ -1005,7 +1192,7 @@ async function handleSlashCommand(
 
 		try {
 			const schedules = await listActiveSchedulesForChannel(env.DB, channelId);
-			const components = createScheduleDeleteComponents(schedules);
+			const components = createScheduleManagementComponentsV2(schedules);
 			return jsonPublicInteractionResponse(formatScheduleList(schedules), {
 				...(components.length > 0 ? { components } : {}),
 				allowedMentions: suppressAllMentions(),
@@ -1186,6 +1373,125 @@ async function handleMessageComponent(
 		return jsonEphemeralInteractionResponse("지원하지 않는 등록 후보입니다.");
 	}
 
+	if (customId.startsWith(UPDATE_SCHEDULE_PREFIX)) {
+		const scheduleId = customId.slice(UPDATE_SCHEDULE_PREFIX.length);
+		return jsonModalResponse({
+			customId: `${UPDATE_SCHEDULE_MODAL_PREFIX}${scheduleId}`,
+			title: "일정 수정",
+			inputCustomId: UPDATE_SCHEDULE_INPUT_ID,
+			label: "변경할 내용",
+			placeholder: "예: 내일 오후 8시로 / 제목을 보스로 / 반복 없애줘",
+		});
+	}
+
+	if (customId.startsWith(OVERRIDE_SCHEDULE_PREFIX)) {
+		const scheduleId = customId.slice(OVERRIDE_SCHEDULE_PREFIX.length);
+		return jsonModalResponse({
+			customId: `${OVERRIDE_SCHEDULE_MODAL_PREFIX}${scheduleId}`,
+			title: "이번만 변경",
+			inputCustomId: OVERRIDE_SCHEDULE_INPUT_ID,
+			label: "이번 알림만 변경할 내용",
+			placeholder: "예: 오늘 오후 10시로 / 이번만 제목을 하드 보스로",
+		});
+	}
+
+	if (customId.startsWith(CANCEL_UPDATE_SCHEDULE_PREFIX)) {
+		const pendingId = customId.slice(CANCEL_UPDATE_SCHEDULE_PREFIX.length);
+		const pending = await getPendingAction(env.DB, pendingId);
+		if (!isPendingActionUsable(pending, new Date())) {
+			return jsonEphemeralInteractionResponse("이미 처리되었거나 만료된 요청입니다.");
+		}
+
+		try {
+			await markPendingActionConsumed(env.DB, pendingId, "cancelled");
+			return jsonEphemeralInteractionResponse("수정을 취소했습니다.");
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			return jsonEphemeralInteractionResponse(`수정 취소 중 오류가 발생했습니다: ${message}`);
+		}
+	}
+
+	if (customId.startsWith(CANCEL_OVERRIDE_SCHEDULE_PREFIX)) {
+		const pendingId = customId.slice(CANCEL_OVERRIDE_SCHEDULE_PREFIX.length);
+		const pending = await getPendingAction(env.DB, pendingId);
+		if (!isPendingActionUsable(pending, new Date())) {
+			return jsonEphemeralInteractionResponse("이미 처리되었거나 만료된 요청입니다.");
+		}
+
+		try {
+			await markPendingActionConsumed(env.DB, pendingId, "cancelled");
+			return jsonEphemeralInteractionResponse("이번만 변경을 취소했습니다.");
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			return jsonEphemeralInteractionResponse(`이번만 변경 취소 중 오류가 발생했습니다: ${message}`);
+		}
+	}
+
+	if (customId.startsWith(CONFIRM_OVERRIDE_SCHEDULE_PREFIX)) {
+		const pendingId = customId.slice(CONFIRM_OVERRIDE_SCHEDULE_PREFIX.length);
+		const pending = await getPendingAction(env.DB, pendingId);
+		if (!isPendingActionUsable(pending, new Date())) {
+			return jsonEphemeralInteractionResponse("이미 처리되었거나 만료된 요청입니다.");
+		}
+
+		const payload = parsePendingScheduleOverridePayload(pending.payload_json);
+		if (!payload) {
+			return jsonEphemeralInteractionResponse("이번만 변경 후보 데이터를 안전하게 읽을 수 없습니다.");
+		}
+
+		const userId = getInteractionUserId(interaction);
+		if (!userId) {
+			return jsonEphemeralInteractionResponse("이번만 변경에 필요한 Discord 사용자 정보를 확인할 수 없습니다.");
+		}
+
+		try {
+			const result = await confirmScheduleOverride(env.DB, payload, userId);
+			if (result === "not_found") {
+				return jsonEphemeralInteractionResponse("없는 일정이거나 이번만 변경할 수 없는 일정입니다.");
+			}
+			await markPendingActionConsumed(env.DB, pendingId, "confirmed");
+			return jsonPublicInteractionResponse(
+				payload.existing_override ? "이번만 변경 교체 완료" : "이번만 변경 적용 완료",
+				{ allowedMentions: suppressAllMentions() },
+			);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			return jsonEphemeralInteractionResponse(`이번만 변경 중 오류가 발생했습니다: ${message}`);
+		}
+	}
+
+	if (customId.startsWith(CONFIRM_UPDATE_SCHEDULE_PREFIX)) {
+		const pendingId = customId.slice(CONFIRM_UPDATE_SCHEDULE_PREFIX.length);
+		const pending = await getPendingAction(env.DB, pendingId);
+		if (!isPendingActionUsable(pending, new Date())) {
+			return jsonEphemeralInteractionResponse("이미 처리되었거나 만료된 요청입니다.");
+		}
+
+		const payload = parsePendingUpdateReminderPayload(pending.payload_json);
+		if (!payload) {
+			return jsonEphemeralInteractionResponse("수정 후보 데이터를 안전하게 읽을 수 없습니다.");
+		}
+
+		const userId = getInteractionUserId(interaction);
+		if (!userId) {
+			return jsonEphemeralInteractionResponse("수정에 필요한 Discord 사용자 정보를 확인할 수 없습니다.");
+		}
+
+		try {
+			const result = await confirmUpdateReminderSchedule(env.DB, payload, userId);
+			if (result === "not_found") {
+				return jsonEphemeralInteractionResponse("없는 일정이거나 수정할 수 없는 일정입니다.");
+			}
+			await markPendingActionConsumed(env.DB, pendingId, "confirmed");
+			return jsonPublicInteractionResponse("수정 완료", {
+				allowedMentions: suppressAllMentions(),
+			});
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			return jsonEphemeralInteractionResponse(`수정 중 오류가 발생했습니다: ${message}`);
+		}
+	}
+
 	if (customId.startsWith(DELETE_SCHEDULE_PREFIX)) {
 		const scheduleId = customId.slice(DELETE_SCHEDULE_PREFIX.length);
 		return jsonEphemeralInteractionResponse("정말 삭제할까요?", {
@@ -1240,6 +1546,134 @@ async function handleMessageComponent(
 	return jsonEphemeralInteractionResponse("지원하지 않는 버튼입니다.");
 }
 
+async function handleModalSubmit(
+	interaction: DiscordInteraction,
+	env: Env,
+): Promise<Response> {
+	const customId = interaction.data?.custom_id;
+	if (customId?.startsWith(OVERRIDE_SCHEDULE_MODAL_PREFIX)) {
+		return handleOverrideModalSubmit(interaction, env, customId);
+	}
+	if (!customId?.startsWith(UPDATE_SCHEDULE_MODAL_PREFIX)) {
+		return jsonEphemeralInteractionResponse("지원하지 않는 입력창입니다.");
+	}
+
+	const scheduleId = customId.slice(UPDATE_SCHEDULE_MODAL_PREFIX.length);
+	const changeInput = getModalTextInputValue(interaction, UPDATE_SCHEDULE_INPUT_ID);
+	const channelId = interaction.channel_id;
+	const userId = getInteractionUserId(interaction);
+	if (!changeInput) {
+		return jsonEphemeralInteractionResponse("변경할 내용을 입력해 주세요.");
+	}
+	if (!channelId || !userId) {
+		return jsonEphemeralInteractionResponse("수정에 필요한 Discord 정보를 확인할 수 없습니다.");
+	}
+
+	const schedule = await getActiveMainReminderSnapshot(env.DB, scheduleId);
+	if (!schedule) {
+		return jsonEphemeralInteractionResponse("없는 일정이거나 수정할 수 없는 일정입니다.");
+	}
+
+	const now = new Date();
+	let update = buildReminderUpdateFromInput(schedule, changeInput, now);
+	if (!update.ok) {
+		const llmResult = await parseWithLlm(changeInput, { now }, env);
+		if (llmResult.status === "ok" && llmResult.value.intent === "update_reminder") {
+			update = buildReminderUpdateFromLlm(schedule, changeInput, llmResult.value, now);
+		} else if (llmResult.status === "invalid") {
+			return jsonEphemeralInteractionResponse(llmResult.userMessage);
+		}
+	}
+
+	if (!update.ok) {
+		return jsonEphemeralInteractionResponse(update.reason);
+	}
+
+	const pendingId = await createPendingUpdateReminderAction(env.DB, {
+		scheduleId,
+		before: update.before,
+		after: update.after,
+		notifyChannelId: channelId,
+		userId,
+		changeInput,
+		preReminderAction: update.preReminderAction,
+	});
+
+	return jsonEphemeralInteractionResponse(formatReminderUpdateCandidate(update), {
+		components: createUpdateConfirmCancelComponents(pendingId),
+		allowedMentions: suppressAllMentions(),
+	});
+}
+
+async function handleOverrideModalSubmit(
+	interaction: DiscordInteraction,
+	env: Env,
+	customId: string,
+): Promise<Response> {
+	const scheduleId = customId.slice(OVERRIDE_SCHEDULE_MODAL_PREFIX.length);
+	const changeInput = getModalTextInputValue(interaction, OVERRIDE_SCHEDULE_INPUT_ID);
+	const channelId = interaction.channel_id;
+	const userId = getInteractionUserId(interaction);
+	if (!changeInput) {
+		return jsonEphemeralInteractionResponse("이번 알림만 변경할 내용을 입력해 주세요.");
+	}
+	if (!channelId || !userId) {
+		return jsonEphemeralInteractionResponse("이번만 변경에 필요한 Discord 정보를 확인할 수 없습니다.");
+	}
+
+	const schedule = await getActiveMainReminderSnapshot(env.DB, scheduleId);
+	if (!schedule) {
+		return jsonEphemeralInteractionResponse("없는 일정이거나 이번만 변경할 수 없는 일정입니다.");
+	}
+
+	const existingOverride = await getPendingScheduleOverride(env.DB, scheduleId);
+	const now = new Date();
+	let override = buildScheduleOverrideFromInput(
+		schedule,
+		changeInput,
+		existingOverride,
+		userId,
+		now,
+	);
+	if (!override.ok) {
+		const llmResult = await parseWithLlmForOverride(changeInput, { now }, env);
+		if (llmResult.status === "ok") {
+			override = buildScheduleOverrideFromLlm(
+				schedule,
+				changeInput,
+				llmResult,
+				existingOverride,
+				userId,
+				now,
+			);
+		} else if (llmResult.status === "invalid") {
+			return jsonEphemeralInteractionResponse(llmResult.userMessage);
+		}
+	}
+	if (!override.ok) {
+		return jsonEphemeralInteractionResponse(override.reason);
+	}
+
+	const pendingId = await createPendingScheduleOverrideAction(env.DB, {
+		scheduleId,
+		beforeSchedule: override.beforeSchedule,
+		existingOverride: override.existingOverride,
+		afterOverride: override.afterOverride,
+		notifyChannelId: channelId,
+		userId,
+		changeInput,
+		preReminderAction: override.preReminderAction,
+	});
+
+	return jsonEphemeralInteractionResponse(formatScheduleOverrideCandidate(override), {
+		components: createOverrideConfirmCancelComponents(
+			pendingId,
+			override.existingOverride !== null,
+		),
+		allowedMentions: suppressAllMentions(),
+	});
+}
+
 async function handleLlmScheduleCandidate(
 	input: string,
 	interaction: DiscordInteraction,
@@ -1291,6 +1725,10 @@ async function createScheduleCandidateResponseFromLlm(
 			components: createConfirmCancelComponents(pendingId),
 			allowedMentions: suppressAllMentions(),
 		});
+	}
+
+	if (value.intent !== "create_reminder") {
+		return jsonEphemeralInteractionResponse("수정은 목록의 수정 버튼에서 진행해 주세요.");
 	}
 
 	const reminder = createReminderCandidateFromLlm(input, value);
@@ -1563,12 +2001,17 @@ export async function listActiveSchedulesForChannel(
 				s.parent_schedule_id,
 				s.reminder_kind,
 				s.offset_minutes,
-				pre.offset_minutes AS pre_offset_minutes
+				pre.offset_minutes AS pre_offset_minutes,
+				so.run_at AS pending_override_run_at,
+				so.title AS pending_override_title
 			FROM schedules s
 			LEFT JOIN schedules pre
 				ON pre.parent_schedule_id = s.id
 				AND pre.reminder_kind = 'pre'
 				AND pre.is_active = 1
+			LEFT JOIN schedule_overrides so
+				ON so.schedule_id = s.id
+				AND so.status = 'pending'
 			WHERE s.is_active = 1
 				AND s.notify_channel_id = ?
 				AND (s.reminder_kind IS NULL OR s.reminder_kind = 'main')
@@ -1576,7 +2019,7 @@ export async function listActiveSchedulesForChannel(
 				CASE WHEN s.next_run_at IS NULL THEN 1 ELSE 0 END ASC,
 				s.next_run_at ASC,
 				s.created_at DESC
-			LIMIT 10`,
+			LIMIT 5`,
 		)
 		.bind(channelId)
 		.all<ScheduleListRow>();
@@ -1621,6 +2064,17 @@ export async function confirmDeleteSchedule(
 				AND is_active = 1`,
 		)
 		.bind(changedBy, now, scheduleId)
+		.run();
+	await db
+		.prepare(
+			`UPDATE schedule_overrides
+			SET
+				status = 'cancelled',
+				updated_at = ?
+			WHERE schedule_id = ?
+				AND status = 'pending'`,
+		)
+		.bind(now, scheduleId)
 		.run();
 
 	const after: ScheduleChangeSnapshot = {
@@ -1798,6 +2252,123 @@ export async function createPendingCrawlScheduleAction(
 	return id;
 }
 
+export async function createPendingUpdateReminderAction(
+	db: D1Database,
+	input: {
+		scheduleId: string;
+		before: ScheduleChangeSnapshot;
+		after: ScheduleChangeSnapshot;
+		notifyChannelId: string;
+		userId: string;
+		changeInput: string;
+		preReminderAction: PreReminderPreviewAction;
+	},
+): Promise<string> {
+	const id = crypto.randomUUID();
+	const now = new Date();
+	const nowIso = now.toISOString();
+	const expiresAt = new Date(now.getTime() + 15 * 60 * 1000).toISOString();
+	const payload: PendingUpdateReminderPayload = {
+		schedule_id: input.scheduleId,
+		before: input.before,
+		after: input.after,
+		notify_channel_id: input.notifyChannelId,
+		created_by: input.userId,
+		change_input: input.changeInput,
+		pre_reminder_action: input.preReminderAction,
+	};
+
+	await db
+		.prepare(
+			`INSERT INTO pending_actions (
+				id,
+				action_type,
+				payload_json,
+				status,
+				created_by,
+				channel_id,
+				guild_id,
+				expires_at,
+				created_at,
+				updated_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		)
+		.bind(
+			id,
+			"update_reminder",
+			JSON.stringify(payload),
+			"pending",
+			input.userId,
+			input.notifyChannelId,
+			null,
+			expiresAt,
+			nowIso,
+			nowIso,
+		)
+		.run();
+
+	return id;
+}
+
+export async function createPendingScheduleOverrideAction(
+	db: D1Database,
+	input: {
+		scheduleId: string;
+		beforeSchedule: ScheduleChangeSnapshot;
+		existingOverride: ScheduleOverrideRow | null;
+		afterOverride: ScheduleOverrideCandidate;
+		notifyChannelId: string;
+		userId: string;
+		changeInput: string;
+		preReminderAction: PreReminderPreviewAction;
+	},
+): Promise<string> {
+	const id = crypto.randomUUID();
+	const now = new Date();
+	const nowIso = now.toISOString();
+	const expiresAt = new Date(now.getTime() + 15 * 60 * 1000).toISOString();
+	const payload: PendingScheduleOverridePayload = {
+		schedule_id: input.scheduleId,
+		before_schedule: input.beforeSchedule,
+		existing_override: input.existingOverride,
+		after_override: input.afterOverride,
+		created_by: input.userId,
+		change_input: input.changeInput,
+		pre_reminder_action: input.preReminderAction,
+	};
+
+	await db
+		.prepare(
+			`INSERT INTO pending_actions (
+				id,
+				action_type,
+				payload_json,
+				status,
+				created_by,
+				channel_id,
+				guild_id,
+				expires_at,
+				created_at,
+				updated_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		)
+		.bind(
+			id,
+			"create_schedule_override",
+			JSON.stringify(payload),
+			"pending",
+			input.userId,
+			input.notifyChannelId,
+			null,
+			expiresAt,
+			nowIso,
+			nowIso,
+		)
+		.run();
+
+	return id;
+}
+
 export async function getPendingAction(
 	db: D1Database,
 	pendingId: string,
@@ -1826,7 +2397,9 @@ export function isPendingActionUsable(
 	return (
 		pending !== null &&
 		(pending.action_type === "create_reminder" ||
-			pending.action_type === "create_crawl_schedule") &&
+			pending.action_type === "create_crawl_schedule" ||
+			pending.action_type === "update_reminder" ||
+			pending.action_type === "create_schedule_override") &&
 		pending.status === "pending" &&
 		new Date(pending.expires_at).getTime() > now.getTime()
 	);
@@ -1895,6 +2468,123 @@ export function parsePendingCrawlSchedulePayload(
 	}
 
 	return null;
+}
+
+export function parsePendingUpdateReminderPayload(
+	payloadJson: string,
+): PendingUpdateReminderPayload | null {
+	try {
+		const parsed = JSON.parse(payloadJson) as Partial<PendingUpdateReminderPayload>;
+		if (
+			typeof parsed.schedule_id === "string" &&
+			isScheduleChangeSnapshot(parsed.before) &&
+			isScheduleChangeSnapshot(parsed.after) &&
+			typeof parsed.notify_channel_id === "string" &&
+			typeof parsed.created_by === "string" &&
+			typeof parsed.change_input === "string" &&
+			isPreReminderPreviewAction(parsed.pre_reminder_action)
+		) {
+			return {
+				schedule_id: parsed.schedule_id,
+				before: parsed.before,
+				after: parsed.after,
+				notify_channel_id: parsed.notify_channel_id,
+				created_by: parsed.created_by,
+				change_input: parsed.change_input,
+				pre_reminder_action: parsed.pre_reminder_action,
+			};
+		}
+	} catch {
+		return null;
+	}
+
+	return null;
+}
+
+export function parsePendingScheduleOverridePayload(
+	payloadJson: string,
+): PendingScheduleOverridePayload | null {
+	try {
+		const parsed = JSON.parse(payloadJson) as Partial<PendingScheduleOverridePayload>;
+		if (
+			typeof parsed.schedule_id === "string" &&
+			isScheduleChangeSnapshot(parsed.before_schedule) &&
+			(parsed.existing_override === null || isScheduleOverrideRow(parsed.existing_override)) &&
+			isScheduleOverrideCandidate(parsed.after_override) &&
+			typeof parsed.created_by === "string" &&
+			typeof parsed.change_input === "string" &&
+			isPreReminderPreviewAction(parsed.pre_reminder_action)
+		) {
+			return {
+				schedule_id: parsed.schedule_id,
+				before_schedule: parsed.before_schedule,
+				existing_override: parsed.existing_override ?? null,
+				after_override: parsed.after_override,
+				created_by: parsed.created_by,
+				change_input: parsed.change_input,
+				pre_reminder_action: parsed.pre_reminder_action,
+			};
+		}
+	} catch {
+		return null;
+	}
+
+	return null;
+}
+
+function isScheduleOverrideRow(value: unknown): value is ScheduleOverrideRow {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) {
+		return false;
+	}
+	const row = value as Partial<ScheduleOverrideRow>;
+	return (
+		typeof row.id === "string" &&
+		typeof row.schedule_id === "string" &&
+		(row.title === null || typeof row.title === "string") &&
+		typeof row.run_at === "string" &&
+		(row.status === "pending" ||
+			row.status === "consumed" ||
+			row.status === "cancelled" ||
+			row.status === "replaced") &&
+		typeof row.created_by === "string" &&
+		(row.consumed_at === null || typeof row.consumed_at === "string") &&
+		typeof row.created_at === "string" &&
+		typeof row.updated_at === "string"
+	);
+}
+
+function isScheduleOverrideCandidate(value: unknown): value is ScheduleOverrideCandidate {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) {
+		return false;
+	}
+	return (
+		isScheduleOverrideRow({ ...value, consumed_at: null }) &&
+		(value as Partial<ScheduleOverrideRow>).status === "pending"
+	);
+}
+
+function isPreReminderPreviewAction(value: unknown): value is PreReminderPreviewAction {
+	return value === "none" || value === "upsert" || value === "disable";
+}
+
+function isScheduleChangeSnapshot(value: unknown): value is ScheduleChangeSnapshot {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) {
+		return false;
+	}
+	const row = value as Partial<ScheduleChangeSnapshot>;
+	return (
+		typeof row.id === "string" &&
+		typeof row.type === "string" &&
+		typeof row.title === "string" &&
+		(row.run_at === null || typeof row.run_at === "string") &&
+		(row.repeat_rule === null || typeof row.repeat_rule === "string") &&
+		typeof row.timezone === "string" &&
+		typeof row.notify_channel_id === "string" &&
+		typeof row.is_active === "number" &&
+		(row.next_run_at === null || typeof row.next_run_at === "string") &&
+		typeof row.created_at === "string" &&
+		typeof row.updated_at === "string"
+	);
 }
 
 export async function markPendingActionConsumed(
@@ -2229,12 +2919,470 @@ async function getActiveScheduleSnapshot(
 	return row ?? null;
 }
 
+export async function getActiveMainReminderSnapshot(
+	db: D1Database,
+	scheduleId: string,
+): Promise<ScheduleChangeSnapshot | null> {
+	const row = await getActiveScheduleSnapshot(db, scheduleId);
+	if (!row || row.type !== "reminder") {
+		return null;
+	}
+
+	if (row.reminder_kind !== null && row.reminder_kind !== "main") {
+		return null;
+	}
+
+	return row;
+}
+
+async function getPendingScheduleOverride(
+	db: D1Database,
+	scheduleId: string,
+): Promise<ScheduleOverrideRow | null> {
+	try {
+		const row = await db
+			.prepare(
+				`SELECT
+				id,
+				schedule_id,
+				title,
+				run_at,
+				status,
+				created_by,
+				consumed_at,
+				created_at,
+				updated_at
+			FROM schedule_overrides
+			WHERE schedule_id = ?
+				AND status = 'pending'
+			ORDER BY run_at ASC
+			LIMIT 1`,
+			)
+			.bind(scheduleId)
+			.first<ScheduleOverrideRow>();
+
+		return isScheduleOverrideRow(row) ? row : null;
+	} catch {
+		return null;
+	}
+}
+
+async function getDuePendingScheduleOverride(
+	db: D1Database,
+	scheduleId: string,
+	nowIso: string,
+): Promise<ScheduleOverrideRow | null> {
+	try {
+		const row = await db
+			.prepare(
+				`SELECT
+				id,
+				schedule_id,
+				title,
+				run_at,
+				status,
+				created_by,
+				consumed_at,
+				created_at,
+				updated_at
+			FROM schedule_overrides
+			WHERE schedule_id = ?
+				AND status = 'pending'
+				AND run_at <= ?
+			ORDER BY run_at ASC
+			LIMIT 1`,
+			)
+			.bind(scheduleId, nowIso)
+			.first<ScheduleOverrideRow>();
+
+		return isScheduleOverrideRow(row) ? row : null;
+	} catch {
+		return null;
+	}
+}
+
+export async function confirmUpdateReminderSchedule(
+	db: D1Database,
+	payload: PendingUpdateReminderPayload,
+	changedBy: string,
+): Promise<"updated" | "not_found"> {
+	const current = await getActiveMainReminderSnapshot(db, payload.schedule_id);
+	if (!current) {
+		return "not_found";
+	}
+
+	const now = new Date();
+	const nowIso = now.toISOString();
+	if (
+		!payload.after.next_run_at ||
+		new Date(payload.after.next_run_at).getTime() <= now.getTime()
+	) {
+		return "not_found";
+	}
+
+	const after: ScheduleChangeSnapshot = {
+		...payload.after,
+		updated_by: changedBy,
+		updated_at: nowIso,
+	};
+
+	await db
+		.prepare(
+			`UPDATE schedules
+			SET
+				title = ?,
+				run_at = ?,
+				repeat_rule = ?,
+				next_run_at = ?,
+				updated_by = ?,
+				updated_at = ?
+			WHERE id = ?
+				AND is_active = 1
+				AND type = 'reminder'
+				AND (reminder_kind IS NULL OR reminder_kind = 'main')`,
+		)
+		.bind(
+			after.title,
+			after.run_at,
+			after.repeat_rule,
+			after.next_run_at,
+			changedBy,
+			nowIso,
+			payload.schedule_id,
+		)
+		.run();
+
+	await insertScheduleChange(db, {
+		scheduleId: payload.schedule_id,
+		changedBy,
+		changeType: "update",
+		beforeJson: JSON.stringify(current),
+		afterJson: JSON.stringify(after),
+	});
+
+	await syncPreReminderForUpdatedSchedule(db, current, after, changedBy, now);
+	return "updated";
+}
+
+export async function confirmScheduleOverride(
+	db: D1Database,
+	payload: PendingScheduleOverridePayload,
+	changedBy: string,
+): Promise<"created" | "not_found"> {
+	const current = await getActiveMainReminderSnapshot(db, payload.schedule_id);
+	if (!current || !isOverrideEligibleSchedule(current)) {
+		return "not_found";
+	}
+
+	const now = new Date();
+	const nowIso = now.toISOString();
+	if (new Date(payload.after_override.run_at).getTime() <= now.getTime()) {
+		return "not_found";
+	}
+
+	const existingOverride = await getPendingScheduleOverride(db, payload.schedule_id);
+	if (existingOverride) {
+		await db
+			.prepare(
+				`UPDATE schedule_overrides
+				SET
+					status = 'replaced',
+					updated_at = ?
+				WHERE id = ?
+					AND status = 'pending'`,
+			)
+			.bind(nowIso, existingOverride.id)
+			.run();
+	}
+
+	await db
+		.prepare(
+			`INSERT INTO schedule_overrides (
+				id,
+				schedule_id,
+				title,
+				run_at,
+				status,
+				created_by,
+				consumed_at,
+				created_at,
+				updated_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		)
+		.bind(
+			payload.after_override.id,
+			payload.after_override.schedule_id,
+			payload.after_override.title,
+			payload.after_override.run_at,
+			"pending",
+			changedBy,
+			null,
+			nowIso,
+			nowIso,
+		)
+		.run();
+
+	const afterSchedule: ScheduleChangeSnapshot = {
+		...current,
+		next_run_at: payload.after_override.run_at,
+		updated_by: changedBy,
+		updated_at: nowIso,
+	};
+	await db
+		.prepare(
+			`UPDATE schedules
+			SET
+				next_run_at = ?,
+				updated_by = ?,
+				updated_at = ?
+			WHERE id = ?
+				AND is_active = 1
+				AND type = 'reminder'
+				AND (reminder_kind IS NULL OR reminder_kind = 'main')`,
+		)
+		.bind(payload.after_override.run_at, changedBy, nowIso, payload.schedule_id)
+		.run();
+
+	await insertScheduleChange(db, {
+		scheduleId: payload.schedule_id,
+		changedBy,
+		changeType: existingOverride ? "override_replace" : "override_create",
+		beforeJson: JSON.stringify(current),
+		afterJson: JSON.stringify(afterSchedule),
+	});
+
+	await syncPreReminderForUpdatedSchedule(db, current, afterSchedule, changedBy, now);
+	return "created";
+}
+
+async function markScheduleOverrideConsumed(
+	db: D1Database,
+	overrideId: string,
+	nowIso: string,
+): Promise<void> {
+	await db
+		.prepare(
+			`UPDATE schedule_overrides
+			SET
+				status = 'consumed',
+				consumed_at = ?,
+				updated_at = ?
+			WHERE id = ?
+				AND status = 'pending'`,
+		)
+		.bind(nowIso, nowIso, overrideId)
+		.run();
+}
+
+async function syncMainPreReminderAfterOverride(
+	db: D1Database,
+	scheduleId: string,
+	nextRunAt: string | null,
+	nowIso: string,
+): Promise<void> {
+	const current = await getActiveMainReminderSnapshot(db, scheduleId);
+	if (!current) {
+		return;
+	}
+
+	const after: ScheduleChangeSnapshot = {
+		...current,
+		run_at: nextRunAt,
+		next_run_at: nextRunAt,
+		updated_at: nowIso,
+	};
+	await syncPreReminderForUpdatedSchedule(
+		db,
+		current,
+		after,
+		current.updated_by ?? current.created_by ?? "",
+		new Date(nowIso),
+	);
+}
+
+async function syncPreReminderForUpdatedSchedule(
+	db: D1Database,
+	before: ScheduleChangeSnapshot,
+	after: ScheduleChangeSnapshot,
+	changedBy: string,
+	nowDate: Date,
+): Promise<void> {
+	const nowIso = nowDate.toISOString();
+	const activePreReminders = await getActivePreReminderSnapshots(db, after.id);
+	const nextPreRunAt =
+		after.next_run_at && isPreReminderEligible(after.repeat_rule)
+			? computePreReminderRunAt(after.next_run_at)
+			: null;
+	const shouldHavePreReminder =
+		nextPreRunAt !== null && new Date(nextPreRunAt).getTime() > nowDate.getTime();
+
+	if (!shouldHavePreReminder) {
+		for (const preReminder of activePreReminders) {
+			const disabled = {
+				...preReminder,
+				is_active: 0,
+				next_run_at: null,
+				updated_by: changedBy,
+				updated_at: nowIso,
+			};
+			await db
+				.prepare(
+					`UPDATE schedules
+					SET
+						is_active = 0,
+						next_run_at = NULL,
+						updated_by = ?,
+						updated_at = ?
+					WHERE id = ?`,
+				)
+				.bind(changedBy, nowIso, preReminder.id)
+				.run();
+			await insertScheduleChange(db, {
+				scheduleId: preReminder.id,
+				changedBy,
+				changeType: "delete_pre_reminder",
+				beforeJson: JSON.stringify(preReminder),
+				afterJson: JSON.stringify(disabled),
+			});
+		}
+		return;
+	}
+
+	const preSnapshot = buildPreReminderScheduleSnapshot(after, changedBy, nowIso, nowDate);
+	if (!preSnapshot) {
+		return;
+	}
+
+	const existing = activePreReminders[0];
+	if (!existing) {
+		await insertPreReminderSnapshot(db, preSnapshot);
+		await insertScheduleChange(db, {
+			scheduleId: preSnapshot.id,
+			changedBy,
+			changeType: "create_pre_reminder",
+			beforeJson: null,
+			afterJson: JSON.stringify(preSnapshot),
+		});
+		return;
+	}
+
+	const updatedPreReminder: ScheduleChangeSnapshot = {
+		...preSnapshot,
+		id: existing.id,
+		created_by: existing.created_by,
+		created_at: existing.created_at,
+		updated_by: changedBy,
+		updated_at: nowIso,
+	};
+	await db
+		.prepare(
+			`UPDATE schedules
+			SET
+				title = ?,
+				run_at = ?,
+				repeat_rule = ?,
+				next_run_at = ?,
+				is_active = 1,
+				updated_by = ?,
+				updated_at = ?
+			WHERE id = ?`,
+		)
+		.bind(
+			updatedPreReminder.title,
+			updatedPreReminder.run_at,
+			updatedPreReminder.repeat_rule,
+			updatedPreReminder.next_run_at,
+			changedBy,
+			nowIso,
+			existing.id,
+		)
+		.run();
+	await insertScheduleChange(db, {
+		scheduleId: existing.id,
+		changedBy,
+		changeType: "update_pre_reminder",
+		beforeJson: JSON.stringify(existing),
+		afterJson: JSON.stringify(updatedPreReminder),
+	});
+
+	for (const extraPreReminder of activePreReminders.slice(1)) {
+		await db
+			.prepare(
+				`UPDATE schedules
+				SET
+					is_active = 0,
+					next_run_at = NULL,
+					updated_by = ?,
+					updated_at = ?
+				WHERE id = ?`,
+			)
+			.bind(changedBy, nowIso, extraPreReminder.id)
+			.run();
+	}
+
+	void before;
+}
+
+async function insertPreReminderSnapshot(
+	db: D1Database,
+	preReminderSnapshot: ScheduleChangeSnapshot,
+): Promise<void> {
+	await db
+		.prepare(
+			`INSERT INTO schedules (
+				id,
+				type,
+				title,
+				run_at,
+				repeat_rule,
+				timezone,
+				notify_channel_id,
+				is_active,
+				next_run_at,
+				parent_schedule_id,
+				reminder_kind,
+				offset_minutes,
+				created_by,
+				updated_by,
+				created_at,
+				updated_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		)
+		.bind(
+			preReminderSnapshot.id,
+			preReminderSnapshot.type,
+			preReminderSnapshot.title,
+			preReminderSnapshot.run_at,
+			preReminderSnapshot.repeat_rule,
+			preReminderSnapshot.timezone,
+			preReminderSnapshot.notify_channel_id,
+			preReminderSnapshot.is_active,
+			preReminderSnapshot.next_run_at,
+			preReminderSnapshot.parent_schedule_id,
+			preReminderSnapshot.reminder_kind,
+			preReminderSnapshot.offset_minutes,
+			preReminderSnapshot.created_by,
+			preReminderSnapshot.updated_by,
+			preReminderSnapshot.created_at,
+			preReminderSnapshot.updated_at,
+		)
+		.run();
+}
+
 export async function insertScheduleChange(
 	db: D1Database,
 	input: {
 		scheduleId: string;
 		changedBy: string;
-		changeType: "create" | "delete" | "create_pre_reminder" | "delete_pre_reminder";
+		changeType:
+			| "create"
+			| "delete"
+			| "update"
+			| "override_create"
+			| "override_replace"
+			| "create_pre_reminder"
+			| "update_pre_reminder"
+			| "delete_pre_reminder";
 		beforeJson: string | null;
 		afterJson: string;
 	},
@@ -2373,6 +3521,26 @@ function getStringOption(
 	);
 
 	return typeof option?.value === "string" ? option.value.trim() : null;
+}
+
+function getModalTextInputValue(
+	interaction: DiscordInteraction,
+	customId: string,
+): string | null {
+	const stack = [...(interaction.data?.components ?? [])];
+	while (stack.length > 0) {
+		const row = stack.pop();
+		for (const component of row?.components ?? []) {
+			if (component.custom_id === customId && typeof component.value === "string") {
+				return component.value.trim();
+			}
+			if (component.components) {
+				stack.push({ components: component.components });
+			}
+		}
+	}
+
+	return null;
 }
 
 export function ruleParseCrawlSchedule(
@@ -2592,6 +3760,434 @@ function createReminderCandidate(
 	};
 }
 
+export function buildReminderUpdateFromInput(
+	schedule: ScheduleChangeSnapshot,
+	input: string,
+	now = new Date(),
+): ReminderUpdateBuildResult {
+	if (schedule.type !== "reminder" || schedule.is_active !== 1) {
+		return { ok: false, reason: "수정할 수 없는 일정입니다." };
+	}
+
+	if (schedule.reminder_kind !== null && schedule.reminder_kind !== "main") {
+		return { ok: false, reason: "사전 알림은 직접 수정할 수 없습니다." };
+	}
+
+	const next = { ...schedule };
+	const title = extractUpdateTitle(input);
+	if (title) {
+		next.title = title;
+	}
+
+	const clearsRepeat = isClearRepeatRequest(input);
+	if (clearsRepeat) {
+		if (!schedule.next_run_at || new Date(schedule.next_run_at).getTime() <= now.getTime()) {
+			return { ok: false, reason: "다음 실행 시각이 없어 반복을 1회성으로 바꿀 수 없습니다." };
+		}
+		next.repeat_rule = null;
+		next.run_at = schedule.next_run_at;
+		next.next_run_at = schedule.next_run_at;
+	}
+
+	const scheduleInput = removeExplicitTitleInstruction(input);
+	const parsed = ruleParseReminderDetailed(scheduleInput, now);
+	if (parsed.ok && !parsed.shouldFallbackToLlm && !isOnlyTimeUpdateInput(scheduleInput)) {
+		next.repeat_rule = parsed.value.repeat ? JSON.stringify(parsed.value.repeat) : null;
+		next.run_at = parsed.value.run_at;
+		next.next_run_at = parsed.value.run_at;
+	} else {
+		const time = parseFlexibleKoreanTime(scheduleInput);
+		if (time) {
+			const applied = applyTimeOnlyUpdate(next, time, now);
+			if (!applied.ok) {
+				return applied;
+			}
+		}
+	}
+
+	return finalizeReminderUpdate(schedule, next, now);
+}
+
+export function buildScheduleOverrideFromInput(
+	schedule: ScheduleChangeSnapshot,
+	input: string,
+	existingOverride: ScheduleOverrideRow | null,
+	createdBy: string,
+	now = new Date(),
+): ScheduleOverrideBuildResult {
+	if (!isOverrideEligibleSchedule(schedule)) {
+		return {
+			ok: false,
+			reason: "이번만 변경은 매일/매주 반복 일정에서만 사용할 수 있습니다.",
+		};
+	}
+
+	if (!schedule.next_run_at || new Date(schedule.next_run_at).getTime() <= now.getTime()) {
+		return { ok: false, reason: "다음 알림 시간이 없어 이번만 변경할 수 없습니다." };
+	}
+
+	const title = extractOverrideTitle(input);
+	const time = parseFlexibleKoreanTime(input);
+	if (!title && !time) {
+		return { ok: false, reason: "이번 알림의 시간이나 제목을 입력해 주세요." };
+	}
+
+	const runAt = time
+		? parseOverrideRunAt(input, schedule.next_run_at, now)
+		: schedule.next_run_at;
+	if (!runAt || new Date(runAt).getTime() <= now.getTime()) {
+		return { ok: false, reason: "이번만 변경할 시간이 과거가 됩니다." };
+	}
+
+	if (
+		existingOverride &&
+		(existingOverride.title ?? schedule.title) === (title ?? schedule.title) &&
+		existingOverride.run_at === runAt
+	) {
+		return { ok: false, reason: "이미 같은 이번만 변경이 설정되어 있습니다." };
+	}
+
+	const nowIso = now.toISOString();
+	const afterOverride: ScheduleOverrideCandidate = {
+		id: crypto.randomUUID(),
+		schedule_id: schedule.id,
+		title,
+		run_at: runAt,
+		status: "pending",
+		created_by: createdBy,
+		created_at: nowIso,
+		updated_at: nowIso,
+	};
+
+	return {
+		ok: true,
+		beforeSchedule: schedule,
+		existingOverride,
+		afterOverride,
+		preReminderAction: previewPreReminderAction(
+			{ next_run_at: runAt, repeat_rule: schedule.repeat_rule },
+			now,
+		),
+	};
+}
+
+function buildScheduleOverrideFromLlm(
+	schedule: ScheduleChangeSnapshot,
+	input: string,
+	llmValue: { run_at: string; title: string | null },
+	existingOverride: ScheduleOverrideRow | null,
+	createdBy: string,
+	now = new Date(),
+): ScheduleOverrideBuildResult {
+	if (!isOverrideEligibleSchedule(schedule)) {
+		return {
+			ok: false,
+			reason: "이번만 변경은 매일/매주 반복 일정에서만 사용할 수 있습니다.",
+		};
+	}
+
+	if (new Date(llmValue.run_at).getTime() <= now.getTime()) {
+		return { ok: false, reason: "이번만 변경할 시간이 과거가 됩니다." };
+	}
+
+	const title = llmValue.title ?? extractOverrideTitle(input);
+
+	if (
+		existingOverride &&
+		(existingOverride.title ?? schedule.title) === (title ?? schedule.title) &&
+		existingOverride.run_at === llmValue.run_at
+	) {
+		return { ok: false, reason: "이미 같은 이번만 변경이 설정되어 있습니다." };
+	}
+
+	const nowIso = now.toISOString();
+	const afterOverride: ScheduleOverrideCandidate = {
+		id: crypto.randomUUID(),
+		schedule_id: schedule.id,
+		title,
+		run_at: llmValue.run_at,
+		status: "pending",
+		created_by: createdBy,
+		created_at: nowIso,
+		updated_at: nowIso,
+	};
+
+	return {
+		ok: true,
+		beforeSchedule: schedule,
+		existingOverride,
+		afterOverride,
+		preReminderAction: previewPreReminderAction(
+			{ next_run_at: llmValue.run_at, repeat_rule: schedule.repeat_rule },
+			now,
+		),
+	};
+}
+
+function isOverrideEligibleSchedule(
+	schedule: Pick<ScheduleChangeSnapshot, "type" | "is_active" | "reminder_kind" | "repeat_rule">,
+): boolean {
+	if (schedule.type !== "reminder" || schedule.is_active !== 1) {
+		return false;
+	}
+
+	if (schedule.reminder_kind !== null && schedule.reminder_kind !== "main") {
+		return false;
+	}
+
+	const repeat = parseRepeatRule(schedule.repeat_rule);
+	return repeat?.type === "daily" || repeat?.type === "weekly";
+}
+
+function extractOverrideTitle(input: string): string | null {
+	const match = input.match(/(?:이번만\s*)?제목\s*(?:은|을|를)?\s*(.+?)\s*(?:으로|로)(?:\s|$)/);
+	if (!match) {
+		return null;
+	}
+
+	return normalizeReminderTitle(match[1]);
+}
+
+function applyTimeToSeoulDate(seoulIso: string, time: TimeOfDay): string {
+	const date = toSeoulDate(new Date(seoulIso));
+	date.setUTCHours(time.hour, time.minute, 0, 0);
+	return formatSeoulIso(date);
+}
+
+function parseOverrideRunAt(input: string, currentRunAt: string, now: Date): string | null {
+	const time = parseFlexibleKoreanTime(input);
+	if (!time) {
+		return null;
+	}
+
+	const absoluteDate = parseAbsoluteDate(input);
+	if (absoluteDate) {
+		return combineAbsoluteDateAndTime(absoluteDate, time, now);
+	}
+
+	const relativeDate = parseRelativeDate(input, now);
+	if (relativeDate) {
+		relativeDate.setUTCHours(time.hour, time.minute, 0, 0);
+		return formatSeoulIso(relativeDate);
+	}
+
+	const bareWeekdayMatch = input.match(new RegExp(`(${KOREAN_DAY_OF_WEEK_PATTERN})`));
+	if (bareWeekdayMatch) {
+		const dayOfWeek = DAY_OF_WEEK_BY_KOREAN[bareWeekdayMatch[1]];
+		if (dayOfWeek) {
+			return nextWeeklyRunAt(dayOfWeek, time, now);
+		}
+	}
+
+	return applyTimeToSeoulDate(currentRunAt, time);
+}
+
+function buildReminderUpdateFromLlm(
+	schedule: ScheduleChangeSnapshot,
+	input: string,
+	value: NormalizedLlmUpdateReminderIntent,
+	now = new Date(),
+): ReminderUpdateBuildResult {
+	const next = { ...schedule };
+	if (value.title) {
+		next.title = value.title;
+	}
+
+	if (value.clear_repeat) {
+		if (!schedule.next_run_at || new Date(schedule.next_run_at).getTime() <= now.getTime()) {
+			return { ok: false, reason: "다음 실행 시각이 없어 반복을 1회성으로 바꿀 수 없습니다." };
+		}
+		next.repeat_rule = null;
+		next.run_at = schedule.next_run_at;
+		next.next_run_at = schedule.next_run_at;
+	}
+
+	if (value.repeat_rule !== undefined) {
+		next.repeat_rule = value.repeat_rule ? JSON.stringify(value.repeat_rule) : null;
+		const nextRunAt = value.repeat_rule
+			? getNextRunAt(JSON.stringify(value.repeat_rule), now.toISOString())
+			: value.run_at ?? schedule.next_run_at;
+		next.run_at = nextRunAt;
+		next.next_run_at = nextRunAt;
+	}
+
+	if (value.run_at) {
+		next.repeat_rule = null;
+		next.run_at = value.run_at;
+		next.next_run_at = value.run_at;
+	}
+
+	void input;
+	return finalizeReminderUpdate(schedule, next, now);
+}
+
+function finalizeReminderUpdate(
+	before: ScheduleChangeSnapshot,
+	after: ScheduleChangeSnapshot,
+	now: Date,
+): ReminderUpdateBuildResult {
+	if (!after.next_run_at || new Date(after.next_run_at).getTime() <= now.getTime()) {
+		return { ok: false, reason: "수정 후 알림 시간이 과거가 됩니다." };
+	}
+
+	if (
+		before.title === after.title &&
+		before.run_at === after.run_at &&
+		before.repeat_rule === after.repeat_rule &&
+		before.next_run_at === after.next_run_at
+	) {
+		return { ok: false, reason: "바뀐 내용이 없습니다." };
+	}
+
+	return {
+		ok: true,
+		before,
+		after,
+		preReminderAction: previewPreReminderAction(after, now),
+	};
+}
+
+function previewPreReminderAction(
+	schedule: Pick<ScheduleChangeSnapshot, "next_run_at" | "repeat_rule">,
+	now: Date,
+): PreReminderPreviewAction {
+	if (!schedule.next_run_at || !isPreReminderEligible(schedule.repeat_rule)) {
+		return "disable";
+	}
+
+	const preRunAt = computePreReminderRunAt(schedule.next_run_at);
+	return new Date(preRunAt).getTime() > now.getTime() ? "upsert" : "disable";
+}
+
+function extractUpdateTitle(input: string): string | null {
+	const match = input.match(/제목\s*(?:을|를)?\s*(.+?)\s*(?:으로|로)\s*(?:바꿔|변경|수정)/);
+	if (!match) {
+		return null;
+	}
+
+	return normalizeReminderTitle(match[1]);
+}
+
+function removeExplicitTitleInstruction(input: string): string {
+	return input.replace(/제목\s*(?:을|를)?\s*.+?\s*(?:으로|로)\s*(?:바꿔|변경|수정)(?:해줘|해|해라|)?/g, "").trim();
+}
+
+function isClearRepeatRequest(input: string): boolean {
+	const normalized = input.replace(/\s+/g, "");
+	return ["반복없애", "반복해제", "한번만", "한번만", "1회성"].some((token) =>
+		normalized.includes(token),
+	);
+}
+
+function isOnlyTimeUpdateInput(input: string): boolean {
+	return parseFlexibleKoreanTime(input) !== null && !hasDateOrRepeatToken(input);
+}
+
+function hasDateOrRepeatToken(input: string): boolean {
+	const normalized = input.replace(/\s+/g, "");
+	return [
+		"오늘",
+		"내일",
+		"모레",
+		"매일",
+		"매주",
+		"분마다",
+		"시간마다",
+		"월요일",
+		"화요일",
+		"수요일",
+		"목요일",
+		"금요일",
+		"토요일",
+		"일요일",
+	].some((token) => normalized.includes(token)) || /\d{1,2}월\d{1,2}일/.test(normalized);
+}
+
+function parseFlexibleKoreanTime(input: string): TimeOfDay | null {
+	const match = input.match(/(?:(오전|오후|아침|저녁|밤|새벽)\s*)?(\d{1,2})(?:\s*시|:)(?:\s*(\d{1,2})\s*분?)?/);
+	if (!match) {
+		return null;
+	}
+
+	const meridiem = match[1];
+	const parsedHour = Number.parseInt(match[2], 10);
+	const minute = Number.parseInt(match[3] ?? "0", 10);
+	if (!Number.isInteger(parsedHour) || !Number.isInteger(minute) || minute < 0 || minute > 59) {
+		return null;
+	}
+
+	let hour = parsedHour;
+	if (meridiem) {
+		if (parsedHour < 1 || parsedHour > 12) {
+			return null;
+		}
+		if (meridiem === "오전" || meridiem === "새벽") {
+			hour = parsedHour % 12;
+		} else if (meridiem === "아침") {
+			hour = parsedHour === 12 ? 12 : parsedHour;
+		} else if (meridiem === "밤") {
+			hour = parsedHour === 12 ? 0 : parsedHour + 12;
+		} else {
+			hour = parsedHour === 12 ? 12 : parsedHour + 12;
+		}
+	}
+
+	if (hour < 0 || hour > 23) {
+		return null;
+	}
+
+	return { hour, minute };
+}
+
+function applyTimeOnlyUpdate(
+	schedule: ScheduleChangeSnapshot,
+	time: TimeOfDay,
+	now: Date,
+): { ok: true } | { ok: false; reason: string } {
+	const repeat = parseRepeatRule(schedule.repeat_rule);
+	if (repeat?.type === "interval") {
+		return { ok: false, reason: "간격 반복 일정은 특정 시각만으로 수정할 수 없습니다." };
+	}
+
+	if (repeat?.type === "daily") {
+		const updatedRepeat: RepeatRule = { ...repeat, time: formatTime(time) };
+		const repeatJson = JSON.stringify(updatedRepeat);
+		const nextRunAt = getNextRunAt(repeatJson, now.toISOString());
+		if (!nextRunAt) {
+			return { ok: false, reason: "다음 실행 시각을 계산할 수 없습니다." };
+		}
+		schedule.repeat_rule = repeatJson;
+		schedule.run_at = nextRunAt;
+		schedule.next_run_at = nextRunAt;
+		return { ok: true };
+	}
+
+	if (repeat?.type === "weekly") {
+		const updatedRepeat: RepeatRule = { ...repeat, time: formatTime(time) };
+		const repeatJson = JSON.stringify(updatedRepeat);
+		const nextRunAt = getNextRunAt(repeatJson, now.toISOString());
+		if (!nextRunAt) {
+			return { ok: false, reason: "다음 실행 시각을 계산할 수 없습니다." };
+		}
+		schedule.repeat_rule = repeatJson;
+		schedule.run_at = nextRunAt;
+		schedule.next_run_at = nextRunAt;
+		return { ok: true };
+	}
+
+	const baseTime = schedule.run_at ?? schedule.next_run_at;
+	if (!baseTime) {
+		return { ok: false, reason: "기준 날짜가 없어 시간을 수정할 수 없습니다." };
+	}
+
+	const updated = toSeoulDate(new Date(baseTime));
+	updated.setUTCHours(time.hour, time.minute, 0, 0);
+	schedule.repeat_rule = null;
+	schedule.run_at = formatSeoulIso(updated);
+	schedule.next_run_at = schedule.run_at;
+	return { ok: true };
+}
+
 function analyzeRuleParserInput(input: string): {
 	confidence: RuleParseConfidence;
 	shouldFallbackToLlm: boolean;
@@ -2769,7 +4365,7 @@ function parseOneTimeRunAt(input: string, now: Date): string | null {
 		return null;
 	}
 
-	const seoulDate = parseRelativeDate(input, now) ?? toSeoulDate(now);
+	const seoulDate = parseRelativeDate(input, now) ?? parseBareWeekdayDate(input, now) ?? toSeoulDate(now);
 	seoulDate.setUTCHours(time.hour, time.minute, 0, 0);
 	return formatSeoulIso(seoulDate);
 }
@@ -2970,6 +4566,23 @@ function toIsoDayOfWeek(seoulDate: Date): number {
 	return day === 0 ? 7 : day;
 }
 
+function parseBareWeekdayDate(input: string, now: Date): Date | null {
+	const match = input.match(new RegExp(`(${KOREAN_DAY_OF_WEEK_PATTERN})`));
+	if (!match) {
+		return null;
+	}
+	const dayOfWeek = DAY_OF_WEEK_BY_KOREAN[match[1]];
+	if (!dayOfWeek) {
+		return null;
+	}
+	const seoulDate = toSeoulDate(now);
+	const currentIsoDay = toIsoDayOfWeek(seoulDate);
+	const targetIsoDay = ISO_DAY_OF_WEEK_BY_DAY[dayOfWeek];
+	const daysToAdd = (targetIsoDay - currentIsoDay + 7) % 7;
+	seoulDate.setUTCDate(seoulDate.getUTCDate() + daysToAdd);
+	return seoulDate;
+}
+
 function parseTimeMatch(match: RegExpMatchArray, startIndex = 1): TimeOfDay | null {
 	const meridiem = match[startIndex];
 	const hourText = match[startIndex + 1];
@@ -3162,6 +4775,72 @@ function formatCrawlScheduleCandidate(candidate: CrawlScheduleCandidate): string
 	].join("\n");
 }
 
+function formatReminderUpdateCandidate(update: Extract<ReminderUpdateBuildResult, { ok: true }>): string {
+	return [
+		"이 일정으로 수정할까요?",
+		"",
+		"[기존]",
+		`제목: ${update.before.title}`,
+		`시간: ${formatScheduleTime(update.before)}`,
+		`반복: ${formatRepeatRule(parseRepeatRule(update.before.repeat_rule))}`,
+		`사전 알림: ${formatPreReminderPreview(previewPreReminderAction(update.before, new Date()))}`,
+		"",
+		"[변경 후]",
+		`제목: ${update.after.title}`,
+		`시간: ${formatScheduleTime(update.after)}`,
+		`반복: ${formatRepeatRule(parseRepeatRule(update.after.repeat_rule))}`,
+		`사전 알림: ${formatPreReminderPreview(update.preReminderAction)}`,
+	].join("\n");
+}
+
+function formatScheduleOverrideCandidate(
+	override: Extract<ScheduleOverrideBuildResult, { ok: true }>,
+): string {
+	const lines = [
+		override.existingOverride
+			? "이미 설정된 이번만 변경을 새 내용으로 교체할까요?"
+			: "이번 한 번만 이렇게 바꿀까요?",
+		"",
+		"[원래 반복]",
+		`제목: ${override.beforeSchedule.title}`,
+		`반복: ${formatRepeatRule(parseRepeatRule(override.beforeSchedule.repeat_rule))}`,
+		`다음 알림: ${formatScheduleTime(override.beforeSchedule)}`,
+	];
+
+	if (override.existingOverride) {
+		lines.push(
+			"",
+			"[현재 예외]",
+			`제목: ${override.existingOverride.title ?? override.beforeSchedule.title}`,
+			`알림 시간: ${formatKoreanDateTime(override.existingOverride.run_at)}`,
+		);
+	}
+
+	lines.push(
+		"",
+		"[이번 1회 예외]",
+		`제목: ${override.afterOverride.title ?? override.beforeSchedule.title}`,
+		`알림 시간: ${formatKoreanDateTime(override.afterOverride.run_at)}`,
+		`사전 알림: ${formatPreReminderPreview(override.preReminderAction)}`,
+		"",
+		"이 알림이 끝나면 다음부터는 원래 반복 일정으로 돌아갑니다.",
+	);
+
+	if (override.preReminderAction !== "upsert") {
+		lines.push("사전 알림 시간이 이미 지나 본 알림만 보냅니다.");
+	}
+
+	return lines.join("\n");
+}
+
+function formatPreReminderPreview(action: PreReminderPreviewAction): string {
+	if (action === "upsert") {
+		return getPreReminderLabel();
+	}
+
+	return "없음";
+}
+
 export function formatScheduleList(schedules: ScheduleListRow[]): string {
 	if (schedules.length === 0) {
 		return "현재 채널에 등록된 활성 알림이 없습니다.";
@@ -3177,7 +4856,7 @@ export function formatScheduleList(schedules: ScheduleListRow[]): string {
 				: item;
 		}),
 		"",
-		"삭제하려면 아래 버튼을 눌러주세요.",
+		"아래 버튼으로 수정·삭제할 수 있습니다.",
 	].join("\n\n");
 }
 
@@ -3197,11 +4876,23 @@ function formatScheduleListItem(schedule: ScheduleListRow, index: number): strin
 	return [
 		`${index + 1}. ${schedule.title}`,
 		`유형: ${formatScheduleType(schedule.type)}`,
-		`시간: ${formatScheduleTime(schedule)}`,
+		`시간: ${formatScheduleTime(schedule)}${formatOverrideAnnotation(schedule)}`,
 		`반복: ${formatRepeatRule(parseRepeatRule(schedule.repeat_rule ?? null))}`,
 		`등록자: ${formatScheduleCreator(schedule.created_by)}`,
 		`상태: ${schedule.is_active === 1 ? "ON" : "OFF"}`,
 	].join("\n");
+}
+
+function formatOverrideAnnotation(schedule: ScheduleListRow): string {
+	if (!schedule.pending_override_run_at) {
+		return "";
+	}
+	const titleOverridden =
+		schedule.pending_override_title &&
+		schedule.pending_override_title !== schedule.title;
+	return titleOverridden
+		? ` (이번만 변경: ${schedule.pending_override_title})`
+		: " (이번만 변경)";
 }
 
 function formatScheduleTime(schedule: ScheduleRow): string {
@@ -3238,13 +4929,21 @@ function formatScheduleType(type: string): string {
 	return type;
 }
 
-function createScheduleDeleteComponents(schedules: ScheduleListRow[]): unknown[] {
-	const buttons = schedules.map((schedule, index) => ({
+function createScheduleManagementComponents(schedules: ScheduleListRow[]): unknown[] {
+	const buttons = schedules.flatMap((schedule, index) => [
+		{
+			type: 2,
+			style: 1,
+			label: `${index + 1} 수정`,
+			custom_id: `${UPDATE_SCHEDULE_PREFIX}${schedule.id}`,
+		},
+		{
 		type: 2,
 		style: 4,
 		label: `${index + 1} 삭제`,
 		custom_id: `${DELETE_SCHEDULE_PREFIX}${schedule.id}`,
-	}));
+		},
+	]);
 
 	const rows = [];
 	for (let index = 0; index < buttons.length; index += 5) {
@@ -3255,6 +4954,89 @@ function createScheduleDeleteComponents(schedules: ScheduleListRow[]): unknown[]
 	}
 
 	return rows;
+}
+
+function createScheduleManagementComponentsV2(schedules: ScheduleListRow[]): unknown[] {
+	return schedules.slice(0, 5).map((schedule, index) => {
+		const components: unknown[] = [
+			{
+				type: 2,
+				style: 1,
+				label: `${index + 1} 수정`,
+				custom_id: `${UPDATE_SCHEDULE_PREFIX}${schedule.id}`,
+			},
+		];
+		if (isOverrideEligibleListSchedule(schedule)) {
+			components.push({
+				type: 2,
+				style: 2,
+				label: `${index + 1} 이번만 변경`,
+				custom_id: `${OVERRIDE_SCHEDULE_PREFIX}${schedule.id}`,
+			});
+		}
+		components.push({
+			type: 2,
+			style: 4,
+			label: `${index + 1} 삭제`,
+			custom_id: `${DELETE_SCHEDULE_PREFIX}${schedule.id}`,
+		});
+		return { type: 1, components };
+	});
+}
+
+function isOverrideEligibleListSchedule(schedule: ScheduleListRow): boolean {
+	if (schedule.type !== "reminder") {
+		return false;
+	}
+	const repeat = parseRepeatRule(schedule.repeat_rule ?? null);
+	return repeat?.type === "daily" || repeat?.type === "weekly";
+}
+
+function createUpdateConfirmCancelComponents(pendingId: string): unknown[] {
+	return [
+		{
+			type: 1,
+			components: [
+				{
+					type: 2,
+					style: 1,
+					label: "수정",
+					custom_id: `${CONFIRM_UPDATE_SCHEDULE_PREFIX}${pendingId}`,
+				},
+				{
+					type: 2,
+					style: 2,
+					label: "취소",
+					custom_id: `${CANCEL_UPDATE_SCHEDULE_PREFIX}${pendingId}`,
+				},
+			],
+		},
+	];
+}
+
+function createOverrideConfirmCancelComponents(
+	pendingId: string,
+	isReplacement: boolean,
+): unknown[] {
+	return [
+		{
+			type: 1,
+			components: [
+				{
+					type: 2,
+					style: 1,
+					label: isReplacement ? "교체" : "적용",
+					custom_id: `${CONFIRM_OVERRIDE_SCHEDULE_PREFIX}${pendingId}`,
+				},
+				{
+					type: 2,
+					style: 2,
+					label: "취소",
+					custom_id: `${CANCEL_OVERRIDE_SCHEDULE_PREFIX}${pendingId}`,
+				},
+			],
+		},
+	];
 }
 
 function createConfirmCancelComponents(pendingId: string): unknown[] {
@@ -3504,6 +5286,39 @@ export function jsonEphemeralInteractionResponse(
 	options: InteractionResponseOptions = {},
 ): Response {
 	return jsonInteractionResponse(content, options, true);
+}
+
+function jsonModalResponse(input: {
+	customId: string;
+	title: string;
+	inputCustomId: string;
+	label: string;
+	placeholder: string;
+}): Response {
+	return json({
+		type: MODAL_RESPONSE,
+		data: {
+			custom_id: input.customId,
+			title: input.title,
+			components: [
+				{
+					type: 1,
+					components: [
+						{
+							type: 4,
+							custom_id: input.inputCustomId,
+							style: 2,
+							label: input.label,
+							placeholder: input.placeholder,
+							required: true,
+							min_length: 1,
+							max_length: 300,
+						},
+					],
+				},
+			],
+		},
+	});
 }
 
 function jsonInteractionResponse(
