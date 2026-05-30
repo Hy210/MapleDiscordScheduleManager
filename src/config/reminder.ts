@@ -1,0 +1,1 @@
+export const PRE_REMINDER_OFFSET_MINUTES = 30;
