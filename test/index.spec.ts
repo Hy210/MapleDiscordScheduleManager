@@ -39,6 +39,7 @@ import worker, {
 	parsePendingUpdateReminderPayload,
 	parseRelativeDate,
 	processDueSchedules,
+	runDailyCleanup,
 	ruleParseReminderDetailed,
 	ruleParseCrawlSchedule,
 	ruleParseReminder,
@@ -3158,5 +3159,71 @@ describe("Discord interaction endpoint", () => {
 		await waitOnExecutionContext(ctx);
 		expect(response.status).toBe(500);
 		expect(await response.text()).toBe("DISCORD_PUBLIC_KEY is not configured");
+	});
+});
+
+describe("Daily cleanup", () => {
+	function makeCleanupDb(onSql?: (sql: string) => void) {
+		return {
+			prepare: (sql: string) => {
+				onSql?.(sql);
+				return { run: async () => ({ success: true }) };
+			},
+		} as unknown as D1Database;
+	}
+
+	it("deletes from all 7 tables in the correct order", async () => {
+		const deletedTables: string[] = [];
+		const db = makeCleanupDb((sql) => {
+			const match = sql.match(/DELETE FROM (\w+)/);
+			if (match) deletedTables.push(match[1]);
+		});
+
+		await runDailyCleanup({ ...env, DB: db });
+
+		expect(deletedTables).toEqual([
+			"pending_actions",
+			"alert_reads",
+			"alerts",
+			"schedule_overrides",
+			"schedule_changes",
+			"schedules",
+			"detected_events",
+		]);
+	});
+
+	it("only deletes inactive schedules", async () => {
+		let schedulesSql = "";
+		const db = makeCleanupDb((sql) => {
+			if (sql.includes("DELETE FROM schedules")) schedulesSql = sql;
+		});
+
+		await runDailyCleanup({ ...env, DB: db });
+
+		expect(schedulesSql).toContain("is_active = 0");
+	});
+
+	it("only deletes non-pending actions", async () => {
+		let pendingActionsSql = "";
+		const db = makeCleanupDb((sql) => {
+			if (sql.includes("DELETE FROM pending_actions")) pendingActionsSql = sql;
+		});
+
+		await runDailyCleanup({ ...env, DB: db });
+
+		expect(pendingActionsSql).toContain("status != 'pending'");
+	});
+
+	it("only deletes non-pending schedule overrides", async () => {
+		let overridesSql = "";
+		const db = makeCleanupDb((sql) => {
+			if (sql.includes("DELETE FROM schedule_overrides")) overridesSql = sql;
+		});
+
+		await runDailyCleanup({ ...env, DB: db });
+
+		expect(overridesSql).toContain("'consumed'");
+		expect(overridesSql).toContain("'replaced'");
+		expect(overridesSql).toContain("'cancelled'");
 	});
 });

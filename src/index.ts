@@ -425,7 +425,7 @@ export default {
 	},
 } satisfies ExportedHandler<Env>;
 
-async function runDailyCleanup(env: Env): Promise<void> {
+export async function runDailyCleanup(env: Env): Promise<void> {
 	const db = env.DB;
 
 	await db
