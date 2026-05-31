@@ -4104,14 +4104,15 @@ function hasDateOrRepeatToken(input: string): boolean {
 }
 
 function parseFlexibleKoreanTime(input: string): TimeOfDay | null {
-	const match = input.match(/(?:(오전|오후|아침|저녁|밤|새벽)\s*)?(\d{1,2})(?:\s*시|:)(?:\s*(\d{1,2})\s*분?)?/);
+	const match = input.match(/(?:(오전|오후|아침|저녁|밤|새벽)\s*)?(\d{1,2})(?:\s*시|:)(?:\s*(\d{1,2}|반)\s*분?)?/);
 	if (!match) {
 		return null;
 	}
 
 	const meridiem = match[1];
 	const parsedHour = Number.parseInt(match[2], 10);
-	const minute = Number.parseInt(match[3] ?? "0", 10);
+	const rawMinute = match[3] ?? "0";
+	const minute = Number.parseInt(rawMinute === "반" ? "30" : rawMinute, 10);
 	if (!Number.isInteger(parsedHour) || !Number.isInteger(minute) || minute < 0 || minute > 59) {
 		return null;
 	}
@@ -4130,6 +4131,9 @@ function parseFlexibleKoreanTime(input: string): TimeOfDay | null {
 		} else {
 			hour = parsedHour === 12 ? 12 : parsedHour + 12;
 		}
+	} else if (isAmbiguousHour(match[2])) {
+		// 오전/오후 없이 1–11시만 입력하면 오후로 가정
+		hour = parsedHour + 12;
 	}
 
 	if (hour < 0 || hour > 23) {

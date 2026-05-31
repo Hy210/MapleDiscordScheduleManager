@@ -2717,6 +2717,30 @@ describe("Discord interaction endpoint", () => {
 		});
 	});
 
+	it("defaults to PM and supports 반 in update modal time input", () => {
+		const now = new Date("2026-04-25T00:00:00.000Z");
+		const base = makeReminderSnapshot({ run_at: "2026-04-26T09:00:00+09:00" });
+
+		// 오전/오후 없는 1–11시 → 오후로 간주
+		expect(buildReminderUpdateFromInput(base, "9시로 바꿔줘", now)).toMatchObject({
+			ok: true,
+			after: { run_at: "2026-04-26T21:00:00+09:00" },
+		});
+
+		// 반 → 30분
+		expect(buildReminderUpdateFromInput(base, "9시 반으로 바꿔줘", now)).toMatchObject({
+			ok: true,
+			after: { run_at: "2026-04-26T21:30:00+09:00" },
+		});
+
+		// 오전 명시 시 기존 동작 유지 (기존 시간과 달라야 변경 감지됨)
+		const baseEvening = makeReminderSnapshot({ run_at: "2026-04-26T21:00:00+09:00" });
+		expect(buildReminderUpdateFromInput(baseEvening, "오전 9시로 바꿔줘", now)).toMatchObject({
+			ok: true,
+			after: { run_at: "2026-04-26T09:00:00+09:00" },
+		});
+	});
+
 	it("updates daily repeat time and recalculates the next run", () => {
 		const result = buildReminderUpdateFromInput(
 			makeReminderSnapshot({
@@ -2847,6 +2871,33 @@ describe("Discord interaction endpoint", () => {
 				run_at: "2026-04-26T22:00:00+09:00",
 			},
 			preReminderAction: "upsert",
+		});
+	});
+
+	it("defaults to PM and supports 반 in override modal time input", () => {
+		const now = new Date("2026-04-25T00:00:00.000Z");
+		const schedule = makeReminderSnapshot({
+			repeat_rule: JSON.stringify({ type: "daily", time: "09:00" }),
+			next_run_at: "2026-04-26T09:00:00+09:00",
+			run_at: "2026-04-26T09:00:00+09:00",
+		});
+
+		// 오전/오후 없는 1–11시 → 오후로 간주
+		expect(buildScheduleOverrideFromInput(schedule, "9시로", null, "user_456", now)).toMatchObject({
+			ok: true,
+			afterOverride: { run_at: "2026-04-26T21:00:00+09:00" },
+		});
+
+		// 반 → 30분
+		expect(buildScheduleOverrideFromInput(schedule, "9시 반으로", null, "user_456", now)).toMatchObject({
+			ok: true,
+			afterOverride: { run_at: "2026-04-26T21:30:00+09:00" },
+		});
+
+		// 오전 명시 시 기존 동작 유지
+		expect(buildScheduleOverrideFromInput(schedule, "오전 9시로", null, "user_456", now)).toMatchObject({
+			ok: true,
+			afterOverride: { run_at: "2026-04-26T09:00:00+09:00" },
 		});
 	});
 
