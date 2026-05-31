@@ -343,7 +343,7 @@ const CRON_DUE_SCHEDULE_LIMIT = 20;
 const MIN_INTERVAL_REMINDER_MINUTES = 5;
 const MIN_INTERVAL_REMINDER_MESSAGE =
 	"반복 알림은 최소 5분 간격부터 등록할 수 있어요.";
-const TIME_PATTERN = String.raw`(?:(오전|오후|아침|저녁|밤|새벽)\s*)?(\d{1,2})(?:(?:\s*시\s*(?:(\d{1,2})\s*분?)?)|(?::(\d{1,2})))`;
+const TIME_PATTERN = String.raw`(?:(오전|오후|아침|저녁|밤|새벽)\s*)?(\d{1,2})(?:(?:\s*시\s*(?:(\d{1,2}|반)\s*분?)?)|(?::(\d{1,2})))`;
 const DAY_OF_WEEK_BY_KOREAN: Record<string, DayOfWeek> = {
 	일요일: "sunday",
 	월요일: "monday",
@@ -4586,8 +4586,16 @@ function parseBareWeekdayDate(input: string, now: Date): Date | null {
 function parseTimeMatch(match: RegExpMatchArray, startIndex = 1): TimeOfDay | null {
 	const meridiem = match[startIndex];
 	const hourText = match[startIndex + 1];
-	const minuteText = match[startIndex + 2] ?? match[startIndex + 3] ?? "0";
-	return parseTime({ meridiem, hourText, minuteText });
+	const rawMinuteText = match[startIndex + 2] ?? match[startIndex + 3] ?? "0";
+	const minuteText = rawMinuteText === "반" ? "30" : rawMinuteText;
+	// 오전/오후 없이 1–11시만 입력하면 오후로 가정
+	const effectiveMeridiem = !meridiem && isAmbiguousHour(hourText) ? "오후" : meridiem;
+	return parseTime({ meridiem: effectiveMeridiem, hourText, minuteText });
+}
+
+function isAmbiguousHour(hourText: string): boolean {
+	const hour = Number.parseInt(hourText, 10);
+	return Number.isInteger(hour) && hour >= 1 && hour <= 11;
 }
 
 function parseTime(input: {

@@ -1384,7 +1384,7 @@ describe("Discord interaction endpoint", () => {
 		});
 		expect(ruleParseReminder("5월 9일 9시에 물약 확인 해줘", now)).toMatchObject({
 			title: "물약 확인",
-			run_at: "2026-05-09T09:00:00+09:00",
+			run_at: "2026-05-09T21:00:00+09:00",
 		});
 		expect(ruleParseReminder("매주 월요일 저녁쯤에 보스돌자고 해줘", now)).toMatchObject({
 			title: "보스돌자",
@@ -1610,6 +1610,75 @@ describe("Discord interaction endpoint", () => {
 		});
 		expect(ruleParseReminder("내일 21:30에 알려줘", now)).toMatchObject({
 			run_at: "2026-04-26T21:30:00+09:00",
+		});
+	});
+
+	it("parses 반 (half-hour) as 30 minutes", () => {
+		const now = new Date("2026-04-25T03:00:00.000Z");
+
+		expect(ruleParseReminder("내일 오후 9시 반에 알려줘", now)).toMatchObject({
+			run_at: "2026-04-26T21:30:00+09:00",
+		});
+		expect(ruleParseReminder("내일 오후 9시반에 알려줘", now)).toMatchObject({
+			run_at: "2026-04-26T21:30:00+09:00",
+		});
+		expect(ruleParseReminder("매주 일요일 오전 9시 반에 알려줘", now)).toMatchObject({
+			run_at: "2026-04-26T09:30:00+09:00",
+			repeat: { type: "weekly", day_of_week: "sunday", time: "09:30" },
+		});
+		expect(ruleParseReminder("매일 오후 9시 반에 알려줘", now)).toMatchObject({
+			run_at: "2026-04-25T21:30:00+09:00",
+			repeat: { type: "daily", time: "21:30" },
+		});
+	});
+
+	it("defaults to PM when no meridiem is given", () => {
+		const now = new Date("2026-04-25T03:00:00.000Z");
+
+		// 1–11시: 오후로 간주
+		expect(ruleParseReminder("내일 9시에 알려줘", now)).toMatchObject({
+			run_at: "2026-04-26T21:00:00+09:00",
+		});
+		expect(ruleParseReminder("내일 1시에 알려줘", now)).toMatchObject({
+			run_at: "2026-04-26T13:00:00+09:00",
+		});
+		expect(ruleParseReminder("내일 11시에 알려줘", now)).toMatchObject({
+			run_at: "2026-04-26T23:00:00+09:00",
+		});
+
+		// 12시: 정오 그대로
+		expect(ruleParseReminder("내일 12시에 알려줘", now)).toMatchObject({
+			run_at: "2026-04-26T12:00:00+09:00",
+		});
+
+		// 0시: 자정 그대로
+		expect(ruleParseReminder("내일 0시에 알려줘", now)).toMatchObject({
+			run_at: "2026-04-26T00:00:00+09:00",
+		});
+
+		// 13–23시: 24시간 표기, 그대로
+		expect(ruleParseReminder("내일 13시에 알려줘", now)).toMatchObject({
+			run_at: "2026-04-26T13:00:00+09:00",
+		});
+		expect(ruleParseReminder("내일 21시에 알려줘", now)).toMatchObject({
+			run_at: "2026-04-26T21:00:00+09:00",
+		});
+
+		// 반복 일정도 동일 적용
+		expect(ruleParseReminder("매일 9시에 알려줘", now)).toMatchObject({
+			run_at: "2026-04-25T21:00:00+09:00",
+			repeat: { type: "daily", time: "21:00" },
+		});
+		expect(ruleParseReminder("매주 목요일 9시에 알려줘", now)).toMatchObject({
+			repeat: { type: "weekly", day_of_week: "thursday", time: "21:00" },
+		});
+
+		// 오전/오후 명시 시 기존 동작 유지
+		expect(ruleParseReminder("내일 오전 9시에 알려줘", now)).toMatchObject({
+			run_at: "2026-04-26T09:00:00+09:00",
+		});
+		expect(ruleParseReminder("내일 오후 9시에 알려줘", now)).toMatchObject({
+			run_at: "2026-04-26T21:00:00+09:00",
 		});
 	});
 
