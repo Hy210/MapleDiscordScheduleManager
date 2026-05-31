@@ -4369,8 +4369,16 @@ function parseOneTimeRunAt(input: string, now: Date): string | null {
 		return null;
 	}
 
-	const seoulDate = parseRelativeDate(input, now) ?? parseBareWeekdayDate(input, now) ?? toSeoulDate(now);
+	const relativeDate = parseRelativeDate(input, now);
+	const bareWeekdayDate = relativeDate === null ? parseBareWeekdayDate(input, now) : null;
+	const seoulDate = relativeDate ?? bareWeekdayDate ?? toSeoulDate(now);
 	seoulDate.setUTCHours(time.hour, time.minute, 0, 0);
+
+	// bare weekday: 오늘이 같은 요일인데 시간이 이미 지났으면 다음 주로
+	if (bareWeekdayDate !== null && new Date(formatSeoulIso(seoulDate)).getTime() <= now.getTime()) {
+		seoulDate.setUTCDate(seoulDate.getUTCDate() + 7);
+	}
+
 	return formatSeoulIso(seoulDate);
 }
 

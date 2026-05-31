@@ -1452,6 +1452,37 @@ describe("Discord interaction endpoint", () => {
 		});
 	});
 
+	it("shifts bare weekday to next week when the time has already passed today", () => {
+		// 2026-04-30 = 목요일. 한국 기준 22:00 = UTC 13:00
+		const thursdayEvening = new Date("2026-04-30T13:00:00.000Z");
+
+		// 목요일 22:00에 "목요일 9시" → 오늘 21:00은 과거 → 다음주 목요일
+		expect(ruleParseReminder("목요일 9시에 알려줘", thursdayEvening)).toMatchObject({
+			run_at: "2026-05-07T21:00:00+09:00",
+			repeat: null,
+		});
+
+		// 목요일 08:00에 "목요일 9시" → 오늘 21:00은 미래 → 오늘
+		const thursdayMorning = new Date("2026-04-30T00:00:00.000Z");
+		expect(ruleParseReminder("목요일 9시에 알려줘", thursdayMorning)).toMatchObject({
+			run_at: "2026-04-30T21:00:00+09:00",
+			repeat: null,
+		});
+
+		// 수요일에 "목요일 9시" → 내일 목요일 (과거 아님)
+		const wednesday = new Date("2026-04-29T13:00:00.000Z");
+		expect(ruleParseReminder("목요일 9시에 알려줘", wednesday)).toMatchObject({
+			run_at: "2026-04-30T21:00:00+09:00",
+			repeat: null,
+		});
+
+		// "이번주 목요일" 명시 → parseRelativeDate 경로, +7일 미적용
+		expect(ruleParseReminder("이번주 목요일 오후 9시에 알려줘", thursdayEvening)).toMatchObject({
+			run_at: "2026-04-30T21:00:00+09:00",
+			repeat: null,
+		});
+	});
+
 	it("rejects relative date reminders without enough information", () => {
 		const now = new Date("2026-04-25T01:00:00.000Z");
 
